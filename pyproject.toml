@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gipler"
+version = "1.0.0"
+description = "Configurable directory comparison and controlled synchronization"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["PySide6>=6.5"]
+
+[project.scripts]
+gipler = "gipler.gui.main_window:main"
+gipler-cli = "gipler.cli:main"
+gipler-tui = "gipler.tui:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gipler*"]
