@@ -12,6 +12,8 @@ from __future__ import annotations
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt, Signal
 from PySide6.QtGui import QColor
 
+from gipler.report import markers, state_detail, tooltip_text
+
 
 class Node:
     __slots__ = ("name", "path", "children", "row", "is_dir", "parent", "pos")
@@ -34,6 +36,7 @@ STATE_COLORS = {
     "identical": "#5f6368",           # gris neutro
     "missing_in_dev": "#9aa0a6",      # gris atenuado (más claro)
     "ambiguous": "#e8710a",           # naranja (ambiguo/sin determinar)
+    "not_comparable": "#8E5CB8",      # violeta (sin hash comparable)
 }
 AMBIGUOUS_INCIDENCES = {
     "status_unrecognized",
@@ -136,11 +139,7 @@ class ComparisonTreeModel(QAbstractItemModel):
             return node.path
         if role == Qt.ToolTipRole:
             if node.row is not None:
-                return (
-                    f"{node.path}\n{node.row.owner} -> {node.row.destination} "
-                    f"| A={node.row.axis_a} B={node.row.axis_b}"
-                    + (f" †{','.join(node.row.incidences)}" if node.row.incidences else "")
-                )
+                return tooltip_text(node.row)
             return node.path
         if role == Qt.CheckStateRole:
             if index.column() == 0 and node.row is not None:
@@ -153,9 +152,11 @@ class ComparisonTreeModel(QAbstractItemModel):
             return None
         if role == Qt.DisplayRole:
             if index.column() == 0:
-                return node.name
+                m = markers(node.row) if node.row is not None else ""
+                return f"{node.name} {m}" if m else node.name
             if node.row is not None and index.column() == 1:
-                return node.row.axis_b
+                detail = state_detail(node.row)
+                return f"{node.row.axis_b} · {detail}" if detail else node.row.axis_b
             if node.row is not None and index.column() == 2:
                 return ",".join(node.row.incidences)
         return None

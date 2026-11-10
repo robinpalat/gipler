@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gipler.report import tooltip_text
+
 
 class SummaryPanel(QFrame):
     open_requested = Signal(object)
@@ -32,7 +34,7 @@ class SummaryPanel(QFrame):
     explorer_requested = Signal(object)
     copy_selection_changed = Signal(object, bool)
 
-    RELEVANT = ("new_in_dev", "modified_in_dev", "missing_in_dev")
+    RELEVANT = ("new_in_dev", "modified_in_dev", "missing_in_dev", "not_comparable")
     RELEVANT_DESTINATIONS = ("principal", "addons")
     WARNING_STATES = ("tracked_modified",)
     REPOSITORY_SETTING = "inicio/repositorio"
@@ -165,9 +167,17 @@ class SummaryPanel(QFrame):
         dev_path = os.path.join(self.dev_root, row.path) if self.dev_root else ""
         repo_root = self.repo_roots.get(row.destination, "")
         repo_path = os.path.join(repo_root, row.path) if repo_root else ""
+        from gipler.report import markers, state_detail
+
+        mark = markers(row)
+        detail = state_detail(row)
         lines = [
-            f"Ruta relativa: {row.path}",
+            f"Ruta relativa: {row.path}" + (f"  [{mark}]" if mark else ""),
             f"Estado A: {row.axis_a}  |  Estado B: {row.axis_b}",
+        ]
+        if detail:
+            lines.append(f"Detalle: {detail}")
+        lines += [
             f"Existencia física — Dev: {dev_m.get('existe', 'no disponible')}  |  "
             f"Repositorio: {repo_m.get('existe', 'no disponible')}",
             f"Dev: {dev_path or '(sin ubicación)'}",
@@ -337,10 +347,7 @@ class SummaryPanel(QFrame):
                 )
             else:
                 item.setFlags(flags & ~Qt.ItemIsUserCheckable)
-            item.setToolTip(
-                f"{r.path}\nDestino: {r.destination} | A={r.axis_a} | B={r.axis_b}"
-                + (f"\nIncidencias: {', '.join(r.incidences)}" if r.incidences else "")
-            )
+            item.setToolTip(tooltip_text(r))
             if color:
                 item.setForeground(QColor(color))
             self.list.addItem(item)

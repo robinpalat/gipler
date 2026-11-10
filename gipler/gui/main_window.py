@@ -9,8 +9,11 @@ Distribución:
 
 from __future__ import annotations
 
-from PySide6.QtGui import QAction
+import os
+
+from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -35,7 +38,14 @@ from gipler.gui.models.comparison_tree import ComparisonTreeModel
 from gipler.gui.models.filter_model import FilterModel, visible_file_count
 
 DESTINATIONS = ("principal", "addons", "sin determinar")
-AXIS_A = ("todos", "new_in_dev", "modified_in_dev", "identical", "missing_in_dev")
+AXIS_A = (
+    "todos",
+    "new_in_dev",
+    "modified_in_dev",
+    "identical",
+    "missing_in_dev",
+    "not_comparable",
+)
 AXIS_B = ("todos", "tracked_modified", "tracked_clean", "untracked", "ignored")
 REPO_LABELS = {"principal": "Principal", "addons": "Addons", "sin determinar": "Sin determinar"}
 
@@ -248,7 +258,14 @@ class GiplerWindow(QMainWindow):
 
     # -- UI -----------------------------------------------------------------
     def _build_ui(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            # Identidad de escritorio: asocia la ventana con gipler.desktop
+            # para que el panel muestre el icono en taskbar y Alt+Tab.
+            app.setApplicationName("Gipler")
+            app.setDesktopFileName("gipler")
         self.setWindowTitle("Gipler")
+        self.setWindowIcon(QIcon(_app_icon()))
         self.resize(1440, 900)
         self.statusBar().showMessage("Análisis no ejecutado (Fase 1)")
 
@@ -378,6 +395,9 @@ class GiplerWindow(QMainWindow):
             ("Modificado (azul)", "modified_in_dev"),
             ("Ambiguo/advertencias (naranja)", "ambiguous"),
             ("Idéntico (gris)", "identical"),
+            ("No comparable (violeta)", "not_comparable"),
+            ("* sincronizado con diferencia Git", ""),
+            ("⌀ diferencia de permisos Dev→repo", ""),
         ):
             lab = QLabel(label)
             leg.addWidget(lab)
@@ -544,7 +564,7 @@ class GiplerWindow(QMainWindow):
         """Expande directorios con archivos con cambios relevantes e
         incidencias, y sus antecesores, en ambos exploradores.
         Respeta los filtros proxy (no expande lo oculto)."""
-        relevant = ("new_in_dev", "modified_in_dev", "missing_in_dev")
+        relevant = ("new_in_dev", "modified_in_dev", "missing_in_dev", "not_comparable")
         from PySide6.QtCore import QModelIndex
         for panel, proxy in (
             (self.dev_panel, self.proxy),
@@ -889,6 +909,17 @@ def _defaults() -> tuple[str, str, str]:
     return configured_paths()
 
 
+def _app_icon() -> str:
+    """Ruta del icono oficial empaquetado (nunca falla si falta el recurso)."""
+    from gipler.resources import master_icon
+
+    try:
+        path = master_icon()
+    except Exception:
+        return ""
+    return path if os.path.isfile(path) else ""
+
+
 def main() -> int:
     from PySide6.QtWidgets import QApplication
 
@@ -897,6 +928,13 @@ def main() -> int:
     dev, principal, addons = _defaults()
     _, rows, info = analyze(dev, principal, addons)
     app = QApplication.instance() or QApplication([])
+    # Identidad de escritorio: permite que el panel (XFCE/GNOME) asocie la
+    # ventana con gipler.desktop y muestre el icono en taskbar y Alt+Tab.
+    app.setApplicationName("Gipler")
+    app.setDesktopFileName("gipler")
+    icon = _app_icon()
+    if icon:
+        app.setWindowIcon(QIcon(icon))
     window = GiplerWindow(rows=rows, meta=info["meta"], warnings=info["warnings"],
                                 snapshot=info.get("snapshot"))
     window.show()

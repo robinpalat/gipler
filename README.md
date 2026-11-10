@@ -29,6 +29,22 @@ installation and are saved in the user's Gipler settings. CLI options
 Application preferences and local exclusions are stored in the user's
 configuration directory.
 
+## Desktop integration
+
+The official icon ships inside the package (`gipler/assets`) and is applied to
+the application window, so it appears in the taskbar and in Alt+Tab.
+
+Install the FreeDesktop launcher and the icon sizes under the user's XDG
+directories:
+
+```sh
+python -m gipler.cli desktop
+python -m gipler.cli desktop --uninstall
+```
+
+Regenerate the packaged sizes from the master `gipler.png` with
+`python tools/gen_icons.py`.
+
 ## Safety
 
 Analysis is read-only. Git is queried only for status and inventory. Copy

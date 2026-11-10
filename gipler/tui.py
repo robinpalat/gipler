@@ -22,6 +22,7 @@ import os
 
 from .analysis import analyze
 from .comparator import make_diff
+from .report import markers, state_detail
 
 TABS = ("principal", "addons", "sin determinar")
 
@@ -33,6 +34,8 @@ FILTERS = (
     ("tracked_modified", "Modificados localmente"),
     ("ignored", "Ignorados por Git"),
     ("missing_in_dev", "Ausentes en Dev"),
+    ("not_comparable", "No comparables"),
+    ("permisos", "Diferencia de permisos Dev→repo"),
     ("incidencias", "Con incidencias"),
 )
 
@@ -61,6 +64,8 @@ class State:
             return base
         if k == "incidencias":
             return [r for r in base if r.incidences]
+        if k == "permisos":
+            return [r for r in base if getattr(r, "perm", "")]
         if k.startswith("tracked_") or k == "ignored":
             return [r for r in base if r.axis_b == k]
         return [r for r in base if r.axis_a == k]
@@ -183,6 +188,14 @@ class State:
             f"Eje A (Dev↔repo): {row.axis_a}",
             f"Eje B (Git): {row.axis_b}",
         ]
+        mark = markers(row)
+        if mark:
+            lines.append(f"Marcador: {mark}")
+        detail_text = state_detail(row)
+        if detail_text:
+            lines.append(f"Detalle: {detail_text}")
+        if getattr(row, "perm", ""):
+            lines.append(f"Permisos Dev→repo: {row.perm}")
         dev_path = os.path.join(absolute_root.get("dev", ""), row.path)
         repo_path = ""
         dest = absolute_root.get(row.destination, "")
@@ -232,9 +245,12 @@ class State:
             mark = ">>" if i == self.cursor else "  "
             sel = "[x]" if (r.destination, r.path) in self.selection else "[ ]"
             tag = self.op_status(r)
+            glyphs = markers(r)
+            detail_text = state_detail(r)
             out.append(
-                f"{mark} {sel} {r.path} | {r.owner} -> {r.destination} "
+                f"{mark} {sel} {r.path}{' ' + glyphs if glyphs else ''} | {r.owner} -> {r.destination} "
                 f"| A={r.axis_a} B={r.axis_b}"
+                + (f" · {detail_text}" if detail_text else "")
                 + (f" †{','.join(r.incidences)}" if r.incidences else "")
                 + (f" [{tag}]" if tag else "")
             )

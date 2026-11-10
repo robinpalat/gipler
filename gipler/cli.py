@@ -4,6 +4,7 @@ Uso:
   python -m gipler.cli analyze
       [--dev Dev] [--principal Repo] [--addons Repo] [--out INFORME] [--diff RUTA]
   python -m gipler.cli tui [--demo] [--dev Dev] [--principal Repo] [--addons Repo]
+  python -m gipler.cli desktop [--uninstall] [--exec ORDEN] [--data-home DIR]
 """
 from __future__ import annotations
 
@@ -38,7 +39,26 @@ def main(argv: list[str] | None = None) -> int:
     t = sub.add_parser("tui", help="Interfaz curses (análisis, navegación, selección, copias controladas)")
     _add_paths(t, d_dev, d_main, d_add)
     t.add_argument("--demo", action="store_true", help="Snapshot no interactivo")
+
+    d = sub.add_parser("desktop", help="Instalar/eliminar lanzador .desktop e iconos hicolor")
+    d.add_argument("--uninstall", action="store_true", help="Retira lo instalado")
+    d.add_argument("--exec", dest="exec_cmd", default=None, help="Orden Exec del lanzador")
+    d.add_argument("--data-home", default=None, help="Directorio XDG_DATA_HOME a usar")
+
     args = p.parse_args(argv)
+
+    if args.command == "desktop":
+        from . import resources
+
+        if args.uninstall:
+            removed = resources.uninstall_desktop(home=args.data_home)
+            sys.stdout.write(
+                "Retirado:\n" + "".join(f"  {p}\n" for p in removed or ["(nada)"])
+            )
+            return 0
+        written = resources.install_desktop(exec_cmd=args.exec_cmd, home=args.data_home)
+        sys.stdout.write("Instalado:\n" + "".join(f"  {p}\n" for p in written))
+        return 0
 
     if args.command == "tui":
         from .tui import make_state, run_curses

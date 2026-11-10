@@ -18,3 +18,10 @@ gipler-tui = "gipler.tui:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["gipler*"]
+
+[tool.setuptools.package-data]
+gipler = [
+    "assets/*.png",
+    "assets/*.ico",
+    "assets/icons/*x*/apps/*.png",
+]

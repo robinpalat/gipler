@@ -64,7 +64,11 @@ class Inspector(QWidget):
         repo_path = os.path.join(repo_root, row.path) if row.destination in ("principal", "addons") else ""
         dev_m = self._meta(dev_path)
         repo_m = self._meta(repo_path) if repo_path else {"existe": "sin destino"}
-        self.summary.setPlainText("\n".join([
+        from gipler.report import markers, state_detail
+
+        mark = markers(row)
+        detail = state_detail(row)
+        lines = [
             f"Ruta: {row.path}",
             f"Dev: {dev_path}",
             f"Repositorio: {repo_path or '(sin destino)'}",
@@ -74,7 +78,14 @@ class Inspector(QWidget):
             f"Estado B (Git): {row.axis_b}",
             f"Incidencias: {', '.join(row.incidences) or 'ninguna'}",
             f"Existencia Dev: {dev_m.get('existe')} / Repositorio: {repo_m.get('existe')}",
-        ]))
+        ]
+        if mark:
+            lines.append(f"Marcador: {mark}")
+        if detail:
+            lines.append(f"Detalle: {detail}")
+        if row.perm:
+            lines.append(f"Permisos Dev→repo: {row.perm}")
+        self.summary.setPlainText("\n".join(lines))
         self.info.setPlainText(
             "[Dev]\n" + self._fmt(dev_m) + "\n\n[Repositorio]\n" + self._fmt(repo_m)
         )

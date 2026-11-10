@@ -25,16 +25,18 @@ PALETTES: dict[str, dict[str, str]] = {
 }
 
 # Colores semánticos adaptados por tema (mismos estados del motor).
+# `not_comparable` usa violeta propio: no es una modificación ni una
+# ambigüedad, y no debe confundirse con el azul de modified_in_dev.
 SEMANTIC: dict[str, dict[str, str]] = {
     "oscuro": {
         "new_in_dev": "#7ED68B", "modified_in_dev": "#6BA6E8",
         "identical": "#A6B0BE", "missing_in_dev": "#7C8594",
-        "ambiguous": "#F2A24B",
+        "ambiguous": "#F2A24B", "not_comparable": "#B39DDB",
     },
     "claro": {
         "new_in_dev": "#1E7B3C", "modified_in_dev": "#2767A5",
         "identical": "#657386", "missing_in_dev": "#8A99AD",
-        "ambiguous": "#B45309",
+        "ambiguous": "#B45309", "not_comparable": "#6A3FA0",
     },
 }
 

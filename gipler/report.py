@@ -48,7 +48,9 @@ class Row:
         return bool(self.perm)
 
     def line(self) -> str:
-        s = f"  {self.path}\n    dueño={self.owner} destino={self.destination} A={self.axis_a} B={self.axis_b}"
+        m = markers(self)
+        s = f"  {self.path}" + (f" [{m}]" if m else "")
+        s += f"\n    dueño={self.owner} destino={self.destination} A={self.axis_a} B={self.axis_b}"
         if self.git_change or self.git_stage:
             s += f" git=[{self.git_change or 'sin detalle'} · {self.git_stage or 'sin fase'}]"
         if self.perm:
@@ -58,6 +60,52 @@ class Row:
         for x in self.extra:
             s += f"\n    {x}"
         return s
+
+
+def markers(row) -> str:
+    """Marcadores ortogonales a los ejes (nunca alteran axis_a ni axis_b).
+
+    `*`  → Dev y árbol de trabajo sincronizados con diferencia Git frente a HEAD.
+    `⌀`  → diferencia exclusiva de permisos Dev→repo.
+    """
+    out = ""
+    if getattr(row, "asterisk", False):
+        out += "*"
+    if getattr(row, "perm_marker", False):
+        out += "⌀"
+    return out
+
+
+def state_detail(row) -> str:
+    """Desglose para la columna de estado: Git (contenido · fase) y permisos.
+
+    Devuelve "" cuando no hay nada que mostrar, de modo que la columna
+    conserva exactamente `axis_b` en el caso normal.
+    """
+    parts: list[str] = []
+    git_change = getattr(row, "git_change", "") or ""
+    git_stage = getattr(row, "git_stage", "") or ""
+    if git_change or git_stage:
+        parts.append(git_change or "sin detalle")
+        parts.append(git_stage or "sin fase")
+    perm = getattr(row, "perm", "") or ""
+    if perm:
+        parts.append(f"⌀ {perm}")
+    return " · ".join(parts)
+
+
+def tooltip_text(row) -> str:
+    """Detalle completo para tooltips (GUI y TUI)."""
+    m = markers(row)
+    d = state_detail(row)
+    out = f"{row.path}\n{row.owner} -> {row.destination} | A={row.axis_a} B={row.axis_b}"
+    if m:
+        out += f"\nMarcador: {m}"
+    if d:
+        out += f"\nDetalle: {d}"
+    if row.incidences:
+        out += f"\nIncidencias: {','.join(row.incidences)}"
+    return out
 
 
 def _counted(rows, pred) -> list[Row]:
