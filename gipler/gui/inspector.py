@@ -61,7 +61,7 @@ class Inspector(QWidget):
     def show_file(self, row: Row, dev_root: str, repo_root: str) -> None:
         """Actualiza las tres pestañas para la fila seleccionada."""
         dev_path = os.path.join(dev_root, row.path)
-        repo_path = os.path.join(repo_root, row.path) if row.destination in ("principal", "addons") else ""
+        repo_path = os.path.join(repo_root, row.path) if repo_root else ""
         dev_m = self._meta(dev_path)
         repo_m = self._meta(repo_path) if repo_path else {"existe": "sin destino"}
         from gipler.report import markers, state_detail

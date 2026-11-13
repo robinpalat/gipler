@@ -53,11 +53,16 @@ def color_for_row(row, theme: str = "oscuro") -> str:
         return ""
     from gipler.gui.theme import semantic
     sm = semantic(theme, "")
+    incidences = set(row.incidences)
+    if (
+        row.axis_a == "new_in_dev"
+        and getattr(row, "post_baseline_new", False)
+    ):
+        incidences.discard("shared_file")
     if (
         not row.owner
         or row.owner == "sin determinar"
-        or row.destination not in ("principal", "addons")
-        or (AMBIGUOUS_INCIDENCES & set(row.incidences))
+        or (AMBIGUOUS_INCIDENCES & incidences)
     ):
         return semantic(theme, "ambiguous")
     return semantic(theme, row.axis_a)
@@ -66,7 +71,7 @@ def color_for_row(row, theme: str = "oscuro") -> str:
 class ComparisonTreeModel(QAbstractItemModel):
     copy_selection_changed = Signal(object, bool)
 
-    def __init__(self, rows: list | None = None, destination: str = "principal", parent=None):
+    def __init__(self, rows: list | None = None, destination: str | None = None, parent=None):
         super().__init__(parent)
         self.destination = destination
         self.checked_keys: set[tuple[str, str]] = set()
@@ -78,12 +83,20 @@ class ComparisonTreeModel(QAbstractItemModel):
             self.set_rows(rows, destination)
 
     # -- construcción -------------------------------------------------
-    def set_rows(self, rows: list, destination: str) -> None:
+    def set_rows(self, rows: list, destination: str | None) -> None:
         self.beginResetModel()
         self.destination = destination
-        self._rows = [r for r in rows if r.destination == destination]
+        self._rows = (
+            list(rows)
+            if destination is None
+            else [r for r in rows if r.destination == destination]
+        )
         self._build()
         self.endResetModel()
+
+    @staticmethod
+    def _selection_key(row, path: str) -> tuple[str, str]:
+        return getattr(row, "selection_key", None) or (row.destination, path)
 
     def _build(self) -> None:
         self._root = Node("", "")
@@ -143,7 +156,8 @@ class ComparisonTreeModel(QAbstractItemModel):
             return node.path
         if role == Qt.CheckStateRole:
             if index.column() == 0 and node.row is not None:
-                return Qt.Checked if (node.row.destination, node.path) in self.checked_keys else Qt.Unchecked
+                key = self._selection_key(node.row, node.path)
+                return Qt.Checked if key in self.checked_keys else Qt.Unchecked
             return None
         if role == Qt.ForegroundRole and index.column() == 0 and node.row is not None:
             color = color_for_row(node.row, self.semantic_theme)
@@ -172,7 +186,7 @@ class ComparisonTreeModel(QAbstractItemModel):
         node = self._node_for(index)
         if node.row is None:
             return False
-        key = (node.row.destination, node.path)
+        key = self._selection_key(node.row, node.path)
         if self.eligible_keys is not None and key not in self.eligible_keys:
             return False
         # Qt pasa el valor como CheckState (enum) o int según la vía:
@@ -193,7 +207,7 @@ class ComparisonTreeModel(QAbstractItemModel):
         base |= Qt.ItemIsEnabled | Qt.ItemIsSelectable
         if index.column() == 0 and index.isValid():
             node = self._node_for(index)
-            key = (node.row.destination, node.path) if node.row is not None else None
+            key = self._selection_key(node.row, node.path) if node.row is not None else None
             if node.row is not None and (
                 self.eligible_keys is None or key in self.eligible_keys
             ):

@@ -43,6 +43,8 @@ class FilterModel(QSortFilterProxyModel):
         self.only_incidences: bool = False
         self.search: str = ""
         self.owner: str = ""
+        self.exclude_identical = False
+        self.git_mode = False
         self.setSortRole(Qt.DisplayRole)
 
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
@@ -61,46 +63,72 @@ class FilterModel(QSortFilterProxyModel):
     def apply(self) -> None:
         self.invalidateFilter()
 
-    def set_criteria(self, axis_a=None, axis_b=None, incidences=False, search="", owner="") -> None:
+    def set_criteria(
+        self,
+        axis_a=None,
+        axis_b=None,
+        incidences=False,
+        search="",
+        owner="",
+        exclude_identical=False,
+    ) -> None:
         self.axis_a = axis_a or None
         self.axis_b = axis_b or None
         self.only_incidences = bool(incidences)
         self.search = search or ""
         self.owner = owner or ""
+        self.exclude_identical = bool(exclude_identical)
         self.apply()
 
-    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
-        src = self.sourceModel()
-        if hasattr(src, "row"):
-            row = src.row(source_row)
-            if self.axis_a and row.axis_a != self.axis_a:
-                return False
-            if self.axis_b and row.axis_b != self.axis_b:
-                return False
-            if self.only_incidences and not row.incidences:
-                return False
-            if self.owner and row.owner != self.owner:
-                return False
-            if self.search and self.search.lower() not in row.path.lower():
-                return False
-            return True
-        if not hasattr(src, "node_at"):
-            return True
-        idx = src.index(source_row, 0, source_parent)
-        node = src.node_at(idx)
-        if node.row is None:
-            return True  # directorio estructural (posible vacío)
-        row = node.row
+    def _row_matches(self, row) -> bool:
+        if self.exclude_identical and row.axis_a == "identical":
+            return False
         if self.axis_a and row.axis_a != self.axis_a:
             return False
-        if self.axis_b and row.axis_b != self.axis_b:
-            return False
+        if self.axis_b:
+            if self.git_mode:
+                statuses = getattr(row, "git_statuses", frozenset())
+                if self.axis_b == "unstaged_changes":
+                    if not ({"modified_unstaged", "untracked"} & statuses):
+                        return False
+                elif self.axis_b not in statuses:
+                    return False
+            elif row.axis_b != self.axis_b:
+                return False
         if self.only_incidences and not row.incidences:
             return False
         if self.owner and row.owner != self.owner:
             return False
         if self.search:
-            needle = self.search.lower()
-            if needle not in row.path.lower() and needle not in os.path.basename(row.path).lower():
+            needle = self.search.casefold()
+            if needle not in row.path.casefold() and needle not in os.path.basename(row.path).casefold():
                 return False
         return True
+
+    def _has_matching_descendant(self, parent: QModelIndex) -> bool:
+        source = self.sourceModel()
+        for row_index in range(source.rowCount(parent)):
+            index = source.index(row_index, 0, parent)
+            node = source.node_at(index)
+            if node.row is not None and self._row_matches(node.row):
+                return True
+            if node.is_dir and self._has_matching_descendant(index):
+                return True
+        return False
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
+        src = self.sourceModel()
+        if hasattr(src, "row"):
+            row = src.row(source_row)
+            return self._row_matches(row)
+        if not hasattr(src, "node_at"):
+            return True
+        idx = src.index(source_row, 0, source_parent)
+        node = src.node_at(idx)
+        if node.row is None:
+            if self.git_mode:
+                return self._has_matching_descendant(idx)
+            if not self.exclude_identical:
+                return True  # directorio estructural, como en la vista histórica
+            return self._has_matching_descendant(idx)
+        return self._row_matches(node.row)

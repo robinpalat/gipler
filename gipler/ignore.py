@@ -1,8 +1,12 @@
 """Exclusión de archivos/carpetas desde la GUI (spec exclusión v1).
 
-Configuración local, fuera del proyecto: ~/.config/gipler/ignore.toml
-(devuelve vacío si no existe). No se guardan exclusiones en Dev ni en
-los repositorios, ni se tocan .gitignore. Sin Git de escritura.
+Configuración local, fuera del proyecto. La ruta por defecto es
+`~/.config/Gipler/ignore.toml` (global, legado); cada perfil de Gipler
+puede inyectar su propio archivo con el parámetro `path`, de modo que
+las exclusiones pertenezcan al perfil y no a la aplicación entera.
+
+No se guardan exclusiones en Dev ni en los repositorios, ni se toca
+.gitignore. Sin Git de escritura.
 """
 from __future__ import annotations
 
@@ -14,8 +18,12 @@ def ignore_path() -> str:
     return os.path.join(os.path.expanduser("~"), ".config", "Gipler", "ignore.toml")
 
 
-def load_patterns() -> list[str]:
-    p = ignore_path()
+def _resolve(path: str | None = None) -> str:
+    return path if path else ignore_path()
+
+
+def load_patterns(path: str | None = None) -> list[str]:
+    p = _resolve(path)
     if not os.path.isfile(p):
         return []
     try:
@@ -26,8 +34,8 @@ def load_patterns() -> list[str]:
         return []
 
 
-def save_patterns(patterns: list[str]) -> None:
-    path = ignore_path()
+def save_patterns(patterns: list[str], path: str | None = None) -> None:
+    path = _resolve(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write("[exclude]\npatterns = [\n")
@@ -36,11 +44,20 @@ def save_patterns(patterns: list[str]) -> None:
         f.write("]\n")
 
 
-def add_pattern(pattern: str) -> list[str]:
-    patterns = load_patterns()
+def add_pattern(pattern: str, path: str | None = None) -> list[str]:
+    patterns = load_patterns(path)
     if pattern not in patterns:
         patterns.append(pattern)
-    save_patterns(patterns)
+        save_patterns(patterns, path)
+    return patterns
+
+
+def remove_pattern(pattern: str, path: str | None = None) -> list[str]:
+    """Retira una regla de exclusión (no toca ningún archivo del árbol)."""
+    current = load_patterns(path)
+    patterns = [p for p in current if p != pattern]
+    if patterns != current:
+        save_patterns(patterns, path)
     return patterns
 
 

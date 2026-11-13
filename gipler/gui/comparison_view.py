@@ -3,9 +3,20 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QHeaderView, QLabel, QMenu, QTreeView, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QMenu,
+    QTreeView,
+    QVBoxLayout,
+    QWidget,
+)
+
+from gipler.gui import icons
+from gipler.gui.git_bar import ElidedLabel
 
 from gipler.gui.models.filter_model import FilterModel
 
@@ -22,6 +33,7 @@ class PanelProxy(FilterModel):
         self.physical_side = ""
         self.dev_root = ""
         self.repo_root = ""
+        self.base_root = ""
 
     def data(self, index, role=Qt.DisplayRole):
         if role == Qt.FontRole and index.isValid():
@@ -36,6 +48,17 @@ class PanelProxy(FilterModel):
                         font = QFont(self.tree_font)
                         font.setStrikeOut(True)
                         return font
+        if (
+            role == Qt.DisplayRole
+            and index.isValid()
+            and index.column() == 0
+            and self.physical_side == "dev"
+        ):
+            source = self.sourceModel()
+            source_index = self.mapToSource(index)
+            node = source.node_at(source_index) if hasattr(source, "node_at") else None
+            if node is not None:
+                return node.name
         return super().data(index, role)
 
     @property
@@ -55,7 +78,22 @@ class ComparisonPanel(QWidget):
 
     def __init__(self, title: str, parent=None):
         super().__init__(parent)
-        self.title_label = QLabel(title)
+        self.is_dev = title == "Dev"
+        self.header = QHBoxLayout()
+        self.header.setContentsMargins(0, 0, 0, 0)
+        self.header.setSpacing(6)
+        self.folder_icon = QLabel()
+        self.folder_icon.setVisible(False)
+        self.folder_icon.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self._folder_icon_color = icons.current_color()
+        self._folder_icon_pending = False
+        self._refresh_folder_icon(force=True)
+        self.folder_icon.setAccessibleName("Directorio de referencia")
+        self.header.addWidget(self.folder_icon, 0, Qt.AlignVCenter)
+        self.title_label = ElidedLabel(title)
+        self.title_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.header.addWidget(self.title_label, 1, Qt.AlignVCenter)
+        self._header_extra = None
         self.tree = QTreeView()
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._open_context_menu)
@@ -67,14 +105,51 @@ class ComparisonPanel(QWidget):
         header.setSectionResizeMode(0, QHeaderView.Interactive)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.Interactive)
-        self._headers = DEV_HEADERS if title == "Dev" else REPO_HEADERS
+        self._headers = DEV_HEADERS if self.is_dev else REPO_HEADERS
         layout = QVBoxLayout(self)
-        layout.addWidget(self.title_label)
+        layout.addLayout(self.header)
         layout.addWidget(self.tree)
+        self.empty_label = QLabel()
+        self.empty_label.setAlignment(Qt.AlignCenter)
+        self.empty_label.setVisible(False)
+        layout.addWidget(self.empty_label)
 
-    def set_title(self, title: str) -> None:
+    def set_empty_message(self, text: str = "") -> None:
+        self.empty_label.setText(text or "")
+        self.empty_label.setVisible(bool(text))
+        self.tree.setVisible(not text)
+
+    def _refresh_folder_icon(self, *, force: bool = False) -> None:
+        color = icons.current_color()
+        if not force and color == self._folder_icon_color:
+            return
+        self._folder_icon_color = color
+        self.folder_icon.setPixmap(icons.icon("folder").pixmap(QSize(16, 16)))
+
+    def _refresh_folder_icon_deferred(self) -> None:
+        self._folder_icon_pending = False
+        self._refresh_folder_icon()
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.PaletteChange:
+            if self._folder_icon_pending:
+                return
+            self._folder_icon_pending = True
+            QTimer.singleShot(0, self._refresh_folder_icon_deferred)
+
+    def set_title(self, title: str, tooltip: str = "") -> None:
         self.title_label.setText(title)
-        self._headers = DEV_HEADERS if title == "Dev" else REPO_HEADERS
+        self.title_label.setToolTip(tooltip or title)
+
+    def set_reference_mode(self, enabled: bool = True) -> None:
+        self.folder_icon.setVisible(enabled)
+
+    def set_header_extra(self, widget: QWidget, stretch: int = 2) -> None:
+        if self._header_extra is not None:
+            self.header.removeWidget(self._header_extra)
+        self._header_extra = widget
+        self.header.addWidget(widget, stretch, Qt.AlignVCenter)
 
     def set_model(self, model) -> None:
         self.tree.setModel(model)
@@ -85,7 +160,7 @@ class ComparisonPanel(QWidget):
         header = self.tree.header()
         header.setMinimumSectionSize(70)
         header.setVisible(True)
-        if self.title_label.text() == "Dev":
+        if self.is_dev:
             self.tree.setColumnHidden(1, True)
             header.setSectionResizeMode(0, QHeaderView.Interactive)
             header.setSectionResizeMode(1, QHeaderView.Interactive)
@@ -104,6 +179,7 @@ class ComparisonPanel(QWidget):
 
     def clear(self) -> None:
         self.tree.setModel(None)
+        self.set_empty_message("")
 
     def _resolve(self, index):
         """Ruta relativa resolvida desde el índice proxy (fuente)."""
@@ -131,11 +207,13 @@ class ComparisonPanel(QWidget):
             menu.exec(self.tree.viewport().mapToGlobal(pos))
 
     def _explorer_base(self) -> str:
+        if self.base_root:
+            return self.base_root
         win = self.window()
         meta = getattr(win, "meta", None)
         if not meta:
             return ""
-        return meta.get("dev", "") if self.title_label.text() == "Dev" else meta.get("principal", "")
+        return meta.get("dev", "") if self.is_dev else meta.get("principal", "")
 
     def _open_in_explorer(self, rel: str, is_dir: bool) -> None:
         import os
@@ -143,7 +221,7 @@ class ComparisonPanel(QWidget):
         from PySide6.QtGui import QDesktopServices
         base = self._explorer_base()
         target = os.path.join(base, rel)
-        if not is_dir and os.path.isfile(target):
+        if not is_dir:
             target = os.path.dirname(os.path.abspath(target))
         elif is_dir and os.path.isdir(target):
             target = os.path.abspath(target)
@@ -158,3 +236,5 @@ class ComparisonPanel(QWidget):
         win = self.window()
         if win is not None and hasattr(win, "status"):
             win.status.showMessage(message)
+        elif win is not None and win.statusBar() is not None:
+            win.statusBar().showMessage(message)

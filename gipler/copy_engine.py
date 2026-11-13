@@ -94,7 +94,7 @@ def build_operations(rows, selection: set[tuple[str, str]], dev: str,
         if r is None:
             continue
         blockers: list[str] = []
-        if r.destination not in ("principal", "addons"):
+        if r.destination not in repos or not repos[r.destination]:
             blockers.append("sin_destino_o_propiedad")
             ops.append(Op(r, dev, repos, "bloqueada", blockers))
             continue

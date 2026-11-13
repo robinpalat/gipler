@@ -111,6 +111,9 @@ QLabel {{ color: {c['texto']}; }}
 def apply_theme(theme: str) -> None:
     app = QApplication.instance()
     if app is not None:
+        from gipler.gui import icons
+
+        icons.clear_cache()
         app.setPalette(palette(theme))
         app.setStyleSheet(stylesheet(theme))
     save_preference(theme)

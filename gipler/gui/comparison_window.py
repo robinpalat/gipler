@@ -37,11 +37,7 @@ class ComparisonWindow(QMainWindow):
         from gipler.gui.inspector import Inspector
 
         dev_m = Inspector._meta(os.path.join(dev_root, row.path))
-        repo_path = (
-            os.path.join(repo_root, row.path)
-            if repo_root and row.destination in ("principal", "addons")
-            else ""
-        )
+        repo_path = os.path.join(repo_root, row.path) if repo_root else ""
         repo_m = Inspector._meta(repo_path) if repo_path else {"existe": "sin destino"}
         title_text = summary_text(row, dev_m, repo_m)
         from PySide6.QtWidgets import QLabel

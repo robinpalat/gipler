@@ -216,39 +216,48 @@ class GuiMarkerTests(unittest.TestCase):
         self.addCleanup(w.close)
         return w
 
-    def _index(self, w, path):
+    def _index(self, w, path, proxy=None):
         from PySide6.QtCore import QModelIndex
 
+        proxy = proxy or w.proxy
         found = []
 
-        def walk(proxy, parent=QModelIndex()):
+        def walk(parent=QModelIndex()):
             for i in range(proxy.rowCount(parent)):
                 idx = proxy.index(i, 0, parent)
                 node = w.tree_model.node_at(proxy.mapToSource(idx))
                 if node.path == path:
                     found.append(idx)
                     return True
-                if walk(proxy, idx):
+                if walk(idx):
                     return True
             return False
 
-        walk(w.proxy)
+        walk()
         return found[0]
 
-    def test_tree_column_zero_shows_markers(self):
+    def test_tree_column_zero_markers_only_in_repository(self):
         rows = [
             _row("star.sh", a="identical", b="tracked_modified"),
             _row("perm.sh", a="identical", perm="755→644"),
             _row("plain.sh", a="modified_in_dev", b="tracked_clean"),
         ]
         w = self._window(rows)
-        for path, expected in (
+        for path, repo_expected in (
             ("star.sh", "star.sh *"),
             ("perm.sh", "perm.sh ⌀"),
             ("plain.sh", "plain.sh"),
         ):
-            idx = self._index(w, path)
-            self.assertEqual(w.proxy.data(idx), expected)
+            dev_idx = self._index(w, path, w.proxy)
+            self.assertEqual(w.proxy.data(dev_idx), path)
+            repo_idx = self._index(w, path, w.repo_proxy)
+            self.assertEqual(w.repo_proxy.data(repo_idx), repo_expected)
+        # El cambio es sólo de presentación: los marcadores siguen en el modelo.
+        self.assertTrue(rows[0].asterisk)
+        self.assertTrue(rows[1].perm_marker)
+        self.assertEqual(rows[0].axis_a, "identical")
+        self.assertEqual(rows[0].axis_b, "tracked_modified")
+        self.assertEqual(rows[1].perm, "755→644")
 
     def test_tree_column_one_keeps_axis_b_and_appends_detail(self):
         rows = [

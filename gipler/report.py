@@ -20,6 +20,7 @@ class Row:
         git_change: str = "",
         git_stage: str = "",
         perm: str = "",
+        selection_key: tuple[str, str] | None = None,
     ):
         self.path = path
         self.owner = owner or "sin determinar"
@@ -32,6 +33,7 @@ class Row:
         self.git_change = git_change  # contenido | permisos | contenido+permisos
         self.git_stage = git_stage    # staged | unstaged | staged+unstaged
         self.perm = perm              # permisos Dev→repo, vacío si coinciden
+        self.selection_key = selection_key
 
     @property
     def asterisk(self) -> bool:
@@ -169,3 +171,38 @@ def render(meta: dict, rows: list[Row], warnings: list[str]) -> str:
             out.append(r.line())
         out.append("")
     return "\n".join(out) + "\n"
+
+
+def render_profile(
+    profile_name: str,
+    work_dir: str,
+    source_names: dict[str, str],
+    rows_by_source: dict[str, tuple[Row, ...]],
+) -> str:
+    """Render comparison results using configured source identities and labels."""
+    out = [
+        f"# Gipler — informe de análisis · {profile_name}",
+        f"Directorio de trabajo: {work_dir}",
+        "Análisis de solo lectura; no se ejecutaron operaciones.",
+        "",
+    ]
+    for source_id, name in source_names.items():
+        rows = list(rows_by_source.get(source_id, ()))
+        counts = {
+            state: sum(row.axis_a == state for row in rows)
+            for state in (
+                "new_in_dev",
+                "modified_in_dev",
+                "identical",
+                "missing_in_dev",
+                "not_comparable",
+            )
+        }
+        out.append(f"## {name} [{source_id}] ({len(rows)} archivos)")
+        out.append(
+            "Estados: "
+            + ", ".join(f"{state}={count}" for state, count in counts.items())
+        )
+        out.extend(row.line() for row in rows)
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"

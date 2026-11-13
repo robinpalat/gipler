@@ -33,6 +33,8 @@ class SummaryPanel(QFrame):
     exclude_requested = Signal(object)
     explorer_requested = Signal(object)
     copy_selection_changed = Signal(object, bool)
+    # (ruta relativa, id de referencia) — decisión de pertenencia, nunca copia.
+    assign_requested = Signal(str, str)
 
     RELEVANT = ("new_in_dev", "modified_in_dev", "missing_in_dev", "not_comparable")
     RELEVANT_DESTINATIONS = ("principal", "addons")
@@ -63,6 +65,7 @@ class SummaryPanel(QFrame):
         self._eligible_copy_keys: set[tuple[str, str]] = set()
         self._scoped_rows: list = []
         self._syncing_checks = False
+        self._dynamic_destinations = False
 
         self.btn_execute = None
         self.btn_prepare = None
@@ -113,7 +116,40 @@ class SummaryPanel(QFrame):
         self.view_selector.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         selectors_layout.setStretch(1, 1)
         selectors_layout.setStretch(3, 1)
+        self.selectors = selectors
         left_layout.addWidget(selectors)
+
+        self.empty_state = QLabel(
+            "No hay ningún perfil abierto. Puedes crear uno desde el menú Perfiles."
+        )
+        self.empty_state.setObjectName("profileEmptyState")
+        self.empty_state.setWordWrap(True)
+        self.empty_state.setAlignment(Qt.AlignCenter)
+        self.empty_state.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.empty_state.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.empty_state.setVisible(False)
+        left_layout.addWidget(self.empty_state)
+
+        # Apartado dedicado: archivos nuevos pendientes de asignación.
+        # No forma parte del inventario general de la lista.
+        self._assignment_targets: list[tuple[str, str]] = []
+        self._assign_combos: dict[str, QComboBox] = {}
+        self.assign_box = QFrame()
+        self.assign_box.setObjectName("pendingAssignments")
+        self.assign_box.setFrameShape(QFrame.StyledPanel)
+        assign_layout = QVBoxLayout(self.assign_box)
+        assign_layout.setContentsMargins(8, 6, 8, 6)
+        self.assign_title = QLabel("Archivos nuevos pendientes de asignación")
+        title_font = self.assign_title.font()
+        title_font.setBold(True)
+        self.assign_title.setFont(title_font)
+        assign_layout.addWidget(self.assign_title)
+        self.assign_rows = QWidget()
+        self.assign_rows_layout = QVBoxLayout(self.assign_rows)
+        self.assign_rows_layout.setContentsMargins(0, 0, 0, 0)
+        assign_layout.addWidget(self.assign_rows)
+        self.assign_box.setVisible(False)
+        left_layout.addWidget(self.assign_box)
         left_layout.addWidget(self.list)
         left.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -160,6 +196,13 @@ class SummaryPanel(QFrame):
         outer.addWidget(split)
 
     # API ---------------------------------------------------------
+    def set_empty_state(self, visible: bool) -> None:
+        self.empty_state.setVisible(visible)
+        self.selectors.setVisible(not visible)
+        self.list.setVisible(not visible)
+        if visible:
+            self.assign_box.setVisible(False)
+
     def set_selected(self, row, dev_m: dict, repo_m: dict) -> None:
         if row is None:
             self.file_info.setText("Sin archivo seleccionado")
@@ -294,9 +337,13 @@ class SummaryPanel(QFrame):
         if eligible_keys is not None:
             self._eligible_copy_keys = set(eligible_keys)
         destination = self.repository_selector.currentData()
-        from gipler.ignore import is_excluded, load_patterns
+        if self._dynamic_destinations:
+            patterns = []
+            is_excluded = lambda _path, _patterns: False
+        else:
+            from gipler.ignore import is_excluded, load_patterns
 
-        patterns = load_patterns()
+            patterns = load_patterns()
         scoped_rows = [
             row for row in self._rows
             if row.destination == destination
@@ -331,7 +378,7 @@ class SummaryPanel(QFrame):
         view = self.view_selector.currentData()
         seen_keys: set[tuple[str, str]] = set()
         for r in scoped_rows:
-            key = (r.destination, r.path)
+            key = getattr(r, "selection_key", None) or (r.destination, r.path)
             if key in seen_keys or not self._matches_view(r, view, blocked_keys, patterns):
                 continue
             seen_keys.add(key)
@@ -403,13 +450,14 @@ class SummaryPanel(QFrame):
 
     def _on_repository_changed(self, _index: int) -> None:
         destination = self.repository_selector.currentData()
-        if destination not in self.RELEVANT_DESTINATIONS:
+        if not self._dynamic_destinations and destination not in self.RELEVANT_DESTINATIONS:
             return
-        from gipler.config import get_settings
+        if not self._dynamic_destinations:
+            from gipler.config import get_settings
 
-        settings = get_settings()
-        settings.setValue(self.REPOSITORY_SETTING, destination)
-        settings.sync()
+            settings = get_settings()
+            settings.setValue(self.REPOSITORY_SETTING, destination)
+            settings.sync()
         self.update_from(self._rows, self._ops_cache)
 
     def _on_view_changed(self, _index: int) -> None:
@@ -424,6 +472,87 @@ class SummaryPanel(QFrame):
     def set_location_roots(self, dev_root: str, repo_roots: dict[str, str]) -> None:
         self.dev_root = dev_root
         self.repo_roots = dict(repo_roots)
+
+    # -- archivos nuevos pendientes de asignación ----------------------
+    def set_assignment_targets(self, targets) -> None:
+        """Referencias activas del perfil, siempre obtenidas dinámicamente."""
+        self._assignment_targets = [
+            (str(source_id), str(name)) for source_id, name in targets
+        ]
+
+    def set_pending_assignments(self, entries) -> None:
+        self._assign_combos.clear()
+        while self.assign_rows_layout.count():
+            item = self.assign_rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        entries = list(entries or ())
+        if not entries:
+            self.assign_box.setVisible(False)
+            return
+        from gipler.gui.theme import load_preference, semantic
+
+        color = semantic(load_preference(), "new_in_dev")
+        for entry in entries:
+            path = entry.path
+            row = QWidget()
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(0, 2, 0, 6)
+            name = QLabel(path)
+            name.setStyleSheet(f"color: {color};")
+            name.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            combo_row = QWidget()
+            combo_layout = QHBoxLayout(combo_row)
+            combo_layout.setContentsMargins(0, 0, 0, 0)
+            label = QLabel("Asignar a")
+            combo = QComboBox()
+            combo.setObjectName(f"assign-{path}")
+            combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            combo.setFixedWidth(280)
+            combo.addItem("Seleccionar referencia…", "")
+            for source_id, source_name in self._assignment_targets:
+                combo.addItem(source_name, source_id)
+            combo.setEnabled(bool(self._assignment_targets))
+            label.setBuddy(combo)
+            combo_layout.addWidget(label)
+            combo_layout.addWidget(combo)
+            combo_layout.addStretch(1)
+            row_layout.addWidget(name)
+            row_layout.addWidget(combo_row)
+            self.assign_rows_layout.addWidget(row)
+            self._assign_combos[path] = combo
+            combo.currentIndexChanged.connect(
+                lambda _index, p=path, c=combo: self._assignment_selected(p, c)
+            )
+        self.assign_box.setVisible(True)
+
+    def pending_paths(self) -> list[str]:
+        return list(self._assign_combos)
+
+    def _assignment_selected(self, path: str, combo: QComboBox) -> None:
+        source_id = combo.currentData() or ""
+        if not source_id:
+            return
+        blocker = QSignalBlocker(combo)
+        combo.setCurrentIndex(0)
+        del blocker
+        self.assign_requested.emit(path, str(source_id))
+
+    def set_destinations(
+        self, destinations: list[tuple[str, str]], selected: str | None = None
+    ) -> None:
+        self._dynamic_destinations = True
+        self.repository_selector.blockSignals(True)
+        self.repository_selector.clear()
+        for destination_id, label in destinations:
+            self.repository_selector.addItem(label, destination_id)
+        index = self.repository_selector.findData(selected)
+        if index < 0 and self.repository_selector.count():
+            index = 0
+        self.repository_selector.setCurrentIndex(index)
+        self.repository_selector.blockSignals(False)
+        self.update_from(self._rows, self._ops_cache)
 
     def _open_menu(self, pos) -> None:
         item = self.list.itemAt(pos)
