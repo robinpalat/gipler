@@ -9,6 +9,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout
 
 from gipler.copy_policy import describe_blockers
+from gipler.gui.identity import apply_window_icon
 
 
 class OperationsDialog(QDialog):
@@ -17,6 +18,7 @@ class OperationsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Revisión de operaciones (preparación, sin ejecutar)")
+        apply_window_icon(self)
         self.table = QTableWidget(0, len(self.HEADER))
         self.table.setHorizontalHeaderLabels(self.HEADER)
         self.table.setColumnWidth(0, 260)

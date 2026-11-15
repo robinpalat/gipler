@@ -27,6 +27,7 @@ import uuid
 from .copy_policy import (
     BLOCKING_INCIDENCES,
     describe_blockers,
+    reverse_row_blockers,
     static_row_blockers,
 )
 
@@ -38,18 +39,35 @@ class PathEscape(OSError):
 
 
 class Op:
-    def __init__(self, row, dev: str, repos: dict[str, str], status: str, blockers: list[str]):
+    def __init__(
+        self,
+        row,
+        dev: str,
+        repos: dict[str, str],
+        status: str,
+        blockers: list[str],
+        *,
+        src_root: str | None = None,
+        dst_root: str | None = None,
+        destination_label: str | None = None,
+    ):
         self.path = row.path
-        self.destination = row.destination
+        self.destination = destination_label or row.destination
         self.axis_a = row.axis_a
         self.axis_b = row.axis_b
         self.owner = row.owner
         self.status = status  # copiable | bloqueada | identica
         self.blockers = blockers
-        self.src = os.path.join(dev, row.path)
-        self.dst = os.path.join(repos[row.destination], row.path) if row.destination in repos else ""
-        self.dev_root = dev
-        self.repo_root = repos[row.destination] if row.destination in repos else ""
+        source_root = dev if src_root is None else src_root
+        target_root = (
+            repos.get(row.destination, "") if dst_root is None else dst_root
+        )
+        self.src = os.path.join(source_root, row.path)
+        self.dst = os.path.join(target_root, row.path) if target_root else ""
+        self.dev_root = source_root
+        self.repo_root = target_root
+        self.src_root = source_root
+        self.dst_root = target_root
         self.src_mode = 0
         self.src_size = 0
         self.is_link = False
@@ -80,10 +98,25 @@ def _real_inside(root: str, target: str) -> bool:
     return _inside(os.path.realpath(root), os.path.realpath(target))
 
 
-def build_operations(rows, selection: set[tuple[str, str]], dev: str,
-                     repos: dict[str, str], snapshot: dict) -> list[Op]:
-    """Verifica cada (destino, path) seleccionado contra la huella.
-    Devuelve operaciones con motivo de bloqueo cuando corresponda."""
+def build_operations(
+    rows,
+    selection: set[tuple[str, str]],
+    dev: str,
+    repos: dict[str, str],
+    snapshot: dict,
+    *,
+    direction: str = "to_reference",
+    destination_label: str | None = None,
+) -> list[Op]:
+    """Verifica cada (referencia, path) seleccionado contra la huella.
+
+    ``to_reference`` copia Dev → referencia; ``to_dev`` copia
+    referencia → Dev usando el mismo motor y las mismas revalidaciones.
+    """
+    reverse = direction == "to_dev"
+    target_label = destination_label
+    if reverse and not target_label:
+        target_label = os.path.basename(os.path.normpath(dev)) or "Dev"
     ops: list[Op] = []
     by_key = {(r.destination, r.path): r for r in rows}
     for key in sorted(selection):
@@ -93,44 +126,116 @@ def build_operations(rows, selection: set[tuple[str, str]], dev: str,
         blockers: list[str] = []
         if r.destination not in repos or not repos[r.destination]:
             blockers.append("sin_destino_o_propiedad")
-            ops.append(Op(r, dev, repos, "bloqueada", blockers))
+            ops.append(
+                Op(
+                    r,
+                    dev,
+                    repos,
+                    "bloqueada",
+                    blockers,
+                    destination_label=target_label,
+                )
+            )
             continue
-        if not _inside(repos[r.destination], os.path.join(repos[r.destination], r.path)):
+        src_root = repos[r.destination] if reverse else dev
+        dst_root = dev if reverse else repos[r.destination]
+        if not _inside(dst_root, os.path.join(dst_root, r.path)):
             blockers.append("ruta_fuera_del_repo")
-        # Eje A.
+        if not _inside(src_root, os.path.join(src_root, r.path)):
+            blockers.append("ruta_fuera_del_repo")
         if r.axis_a == "identical":
-            ops.append(Op(r, dev, repos, "identica", ["sin_cambios"]))
+            ops.append(
+                Op(
+                    r,
+                    dev,
+                    repos,
+                    "identica",
+                    ["sin_cambios"],
+                    src_root=src_root,
+                    dst_root=dst_root,
+                    destination_label=target_label,
+                )
+            )
             continue
-        if r.axis_a == "missing_in_dev":
-            ops.append(Op(r, dev, repos, "bloqueada", ["missing_in_dev"]))
-            continue
-        blockers.extend(static_row_blockers(r))
-        # Re-check origen y destino frente a la huella del análisis.
-        src = os.path.join(dev, r.path)
-        dst = os.path.join(repos[r.destination], r.path) if r.destination in repos else ""
-        snap_dev = (snapshot.get("dev") or {}).get(r.path)
+        if reverse:
+            if r.axis_a == "new_in_dev":
+                ops.append(
+                    Op(
+                        r,
+                        dev,
+                        repos,
+                        "bloqueada",
+                        ["missing_in_reference"],
+                        src_root=src_root,
+                        dst_root=dst_root,
+                        destination_label=target_label,
+                    )
+                )
+                continue
+            blockers.extend(reverse_row_blockers(r))
+            snap_src = (
+                (snapshot.get("repos") or {})
+                .get(r.destination, {})
+                .get(r.path)
+            )
+            snap_dst = (snapshot.get("dev") or {}).get(r.path)
+        else:
+            if r.axis_a == "missing_in_dev":
+                ops.append(
+                    Op(
+                        r,
+                        dev,
+                        repos,
+                        "bloqueada",
+                        ["missing_in_dev"],
+                        src_root=src_root,
+                        dst_root=dst_root,
+                    )
+                )
+                continue
+            blockers.extend(static_row_blockers(r))
+            snap_src = (snapshot.get("dev") or {}).get(r.path)
+            snap_dst = (
+                (snapshot.get("repos") or {})
+                .get(r.destination, {})
+                .get(r.path)
+            )
+        src = os.path.join(src_root, r.path)
+        dst = os.path.join(dst_root, r.path)
         if not os.path.lexists(src):
             blockers.append("origen_ya_no_existe")
-        elif snap_dev is not None and _sha(src) != snap_dev:
+        elif snap_src is None:
+            blockers.append("origen_no_existe_en_analisis")
+        elif _sha(src) != snap_src:
             blockers.append("origen_cambio_desde_analisis")
         if os.path.islink(src):
-            resolved = os.path.normpath(os.path.join(dev, os.path.dirname(r.path), os.readlink(src)))
-            if not _inside(dev, resolved) or not _real_inside(dev, resolved):
+            resolved = os.path.normpath(
+                os.path.join(src_root, os.path.dirname(r.path), os.readlink(src))
+            )
+            if not _inside(src_root, resolved) or not _real_inside(src_root, resolved):
                 blockers.append("symlink_externo_rechazado")
-        snap_repo = (snapshot.get("repos") or {}).get(r.destination, {}).get(r.path)
         if os.path.lexists(dst):
-            if snap_repo is None or _sha(dst) != snap_repo:
+            if snap_dst is None or _sha(dst) != snap_dst:
                 blockers.append("destino_cambio_desde_analisis")
-        elif snap_repo is not None:
+        elif snap_dst is not None:
             blockers.append("destino_desaparecio")
         blockers = list(dict.fromkeys(blockers))
         src_mode = os.lstat(src).st_mode & 0o777 if os.path.lexists(src) else 0
-        op = Op(r, dev, repos, "bloqueada" if blockers else "copiable", blockers)
+        op = Op(
+            r,
+            dev,
+            repos,
+            "bloqueada" if blockers else "copiable",
+            blockers,
+            src_root=src_root,
+            dst_root=dst_root,
+            destination_label=target_label,
+        )
         op.src_mode = src_mode
         op.src_size = os.lstat(src).st_size if os.path.lexists(src) else 0
         op.is_link = os.path.islink(src) if os.path.lexists(src) else False
         op.src_hash = _sha(src) if os.path.lexists(src) else None
-        op.snap_repo_hash = snap_repo
+        op.snap_repo_hash = snap_dst
         ops.append(op)
     return ops
 

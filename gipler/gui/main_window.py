@@ -1,7 +1,7 @@
 """Ventana principal (Fases 1-5 spec GUI QT 1.0 + rediseño de usabilidad).
 
 Distribución:
-- Barra superior: selector de repositorio (segmentado) + acciones.
+- Barra superior: navegación, actualización, espacio de trabajo y configuración.
 - Barra contextual con vista, filtros, búsqueda y estado operativo.
 - Zona principal dominante: Dev | Repositorio | Inspector (QSplitter).
 - Barra inferior informativa.
@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -24,26 +23,26 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QSplitter,
     QStackedWidget,
     QStatusBar,
-    QStyle,
     QToolBar,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtCore import Qt, QModelIndex
+from PySide6.QtCore import QPoint, Qt, QModelIndex
 from gipler.gui.comparison_view import ComparisonPanel
+from gipler.gui.identity import application_icon, apply_window_icon
 from gipler.selection import (
     selection_key_for,
     selection_keys_for_path,
 )
 from gipler.gui.navbutton import EditorialNavButton
 from gipler.gui.summary_panel import SummaryPanel
-from gipler.gui.styles import make_context_label
+from gipler.gui.styles import make_context_icon_button, make_context_label
 from gipler.gui.models.comparison_tree import ComparisonTreeModel
 from gipler.gui.models.filter_model import FilterModel, visible_file_count
 
@@ -92,13 +91,16 @@ class ProfileSwitchDialog(QDialog):
         super().__init__(window)
         self.window = window
         self.profile_id: str | None = None
-        self.setWindowTitle("Cambiar perfil")
+        self.setWindowTitle("Cambiar espacio de trabajo")
+        apply_window_icon(self)
         self.setMinimumWidth(460)
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
-        layout.addWidget(QLabel("Seleccione el perfil que desea abrir."))
+        layout.addWidget(
+            QLabel("Seleccione el espacio de trabajo que desea abrir.")
+        )
         self.profiles = QListWidget()
-        self.profiles.setAccessibleName("Perfiles disponibles")
+        self.profiles.setAccessibleName("Espacios de trabajo disponibles")
         layout.addWidget(self.profiles, 1)
         self.active_label = QLabel("")
         self.active_label.setObjectName("contextLabel")
@@ -134,7 +136,9 @@ class ProfileSwitchDialog(QDialog):
                 item.setFont(font)
             self.profiles.addItem(item)
         self.active_label.setText(
-            f"Perfil activo: {active_name}" if active_name else "Perfil activo: ninguno"
+            f"Espacio de trabajo activo: {active_name}"
+            if active_name
+            else "Espacio de trabajo activo: ninguno"
         )
         if self.profiles.count():
             self.profiles.setCurrentRow(0)
@@ -160,6 +164,7 @@ class ProfileAdminDialog(QDialog):
         self.window = window
         self.profile = window.profile
         self.setWindowTitle("Administrar perfil")
+        apply_window_icon(self)
         self.setMinimumWidth(560)
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -300,10 +305,8 @@ class GiplerWindow(QMainWindow):
             },
         }
         self.snapshot = self.profile_analysis.snapshot
-        sources = sorted(profile.sources, key=lambda source: source.order)
-        self._destination = next(
-            (source.id for source in sources if source.enabled), "sin determinar"
-        )
+        references = self._reference_sources()
+        self._destination = references[0].id if references else "sin determinar"
         from gipler.gui.selection import SelectionController
         self.selection_ctrl = SelectionController()
         self._eligible_copy_keys: set[tuple[str, str]] | None = None
@@ -364,6 +367,20 @@ class GiplerWindow(QMainWindow):
         self.dest_panel.tree.doubleClicked.connect(self._on_double_clicked)
         self.dev_panel.exclude_requested.connect(lambda p: self.exclude_path(p, self._path_is_dir(p)))
         self.dest_panel.exclude_requested.connect(lambda p: self.exclude_path(p, self._path_is_dir(p)))
+        self.dev_panel.copy_requested.connect(
+            lambda row, side: self._copy_row_to_destination(
+                row, direction="to_reference"
+            )
+        )
+        self.dest_panel.copy_requested.connect(
+            lambda row, side: self._copy_row_to_destination(
+                row, direction="to_dev"
+            )
+        )
+        self.dev_panel.delete_requested.connect(self._delete_row)
+        self.dest_panel.delete_requested.connect(self._delete_row)
+        self.dev_panel.discard_requested.connect(self._discard_row)
+        self.dest_panel.discard_requested.connect(self._discard_row)
 
     def _path_is_dir(self, rel: str) -> bool:
         paths = {n.path for n in self.tree_model.file_nodes()}
@@ -955,7 +972,7 @@ class GiplerWindow(QMainWindow):
         self.status.showMessage(f"Vista: {self._destination} · visibles: {n} archivos · seleccionados: {selected}")
 
     def set_destination(self, dest: str) -> None:
-        valid = set(self.repo_buttons) | {"sin determinar"}
+        valid = self._reference_ids() | {"sin determinar"}
         if dest not in valid:
             return
         if dest != self._destination:
@@ -973,6 +990,13 @@ class GiplerWindow(QMainWindow):
             self._reference_title(dest),
             tooltip=self._repo_root_for(dest),
         )
+        if dest == "sin determinar":
+            empty_text = "No hay directorios de referencia configurados."
+            self.dev_panel.set_empty_message(empty_text)
+            self.dest_panel.set_empty_message(empty_text)
+        else:
+            self.dev_panel.set_empty_message("")
+            self.dest_panel.set_empty_message("")
         self._refresh_active_git_bar()
         self._update_git_option()
         if self._view_mode == "git":
@@ -988,11 +1012,25 @@ class GiplerWindow(QMainWindow):
 
     # -- Git contextual -------------------------------------------------
     def _reference_title(self, destination: str) -> str:
+        if destination == "sin determinar":
+            return "Sin referencia"
         root = self._repo_root_for(destination)
         if root:
             name = os.path.basename(os.path.normpath(root))
             return name or root
         return "Repositorio"
+
+    def _reference_sources(self):
+        if self.profile is None:
+            return []
+        return [
+            source
+            for source in sorted(self.profile.sources, key=lambda item: item.order)
+            if source.enabled
+        ]
+
+    def _reference_ids(self) -> set[str]:
+        return {source.id for source in self._reference_sources()}
 
     def _git_destinations(self) -> dict[str, tuple[str, bool]]:
         if self.profile is not None:
@@ -1128,53 +1166,36 @@ class GiplerWindow(QMainWindow):
             app.setApplicationName("Gipler")
             app.setDesktopFileName("gipler")
         self.setWindowTitle("Gipler")
-        self.setWindowIcon(QIcon(_app_icon()))
+        apply_window_icon(self)
         self.resize(1440, 900)
         self.statusBar().showMessage("Análisis no ejecutado (Fase 1)")
 
-        # Barra superior: pestañas (Inicio + destinos) y, a la derecha,
-        # el menú de herramientas (no son espacios de trabajo).
+        # Barra superior: navegación y controles globales.
         bar = QToolBar("Principal", self)
         bar.setObjectName("navigationToolbar")
+        bar.setMovable(False)
+        bar.setFloatable(False)
         self.addToolBar(bar)
         self.nav_toolbar = bar
-        self.tools_menu = self.menuBar().addMenu("Herramientas")
-        act_update = QAction("Actualizar", self)
-        act_update.triggered.connect(self.reanalyze)
-        self.tools_menu.addAction(act_update)
-        theme_menu = self.tools_menu.addMenu("Apariencia")
-        for name in ("oscuro", "claro"):
-            act = QAction("Oscuro grafito" if name == "oscuro" else "Claro", self)
-            act.triggered.connect(lambda _c=False, t=name: self.apply_theme(t))
-            theme_menu.addAction(act)
-        self.repo_buttons: dict[str, QPushButton] = {}
+        self._reanalyzing = False
         self.nav_buttons: dict[str, QPushButton] = {}
         group = QButtonGroup(self)
         group.setExclusive(True)
         self.nav_group = group
-        # Inicio es la primera pestaña de control; el resto son destinos.
+        # Funciones permanentes de Gipler; la referencia se elige en Inicio.
         start = EditorialNavButton("Inicio")
         start.setCheckable(True)
         start.clicked.connect(self._show_inicio)
         self.nav_buttons["inicio"] = start
         group.addButton(start)
         bar.addWidget(start)
-        destinations = [
-            (source.id, source.name if source.enabled else f"{source.name} (desactivada)")
-            for source in sorted(self.profile.sources, key=lambda source: source.order)
-        ]
-        for name, label in destinations:
-            b = EditorialNavButton(label)
-            b.setCheckable(True)
-            b.setChecked(name == self._destination)
-            source = self.profile.source(name)
-            b.setEnabled(source.enabled if source is not None else True)
-            b.clicked.connect(lambda _checked=False, dest=name: self._on_repo(button=dest))
-            self.repo_buttons[name] = b
-            group.addButton(b)
-            bar.addWidget(b)
+        differences = EditorialNavButton("Diferencias")
+        differences.setCheckable(True)
+        differences.clicked.connect(self._show_diferencias)
+        self.nav_buttons["diferencias"] = differences
+        group.addButton(differences)
+        bar.addWidget(differences)
         self.admin_buttons: dict[str, QPushButton] = {}
-        self._admin_nav_actions = []
         for key, label in (
             ("excluidos", "Excluidos"),
             ("indeterminados", "Indeterminados"),
@@ -1186,13 +1207,39 @@ class GiplerWindow(QMainWindow):
             )
             self.admin_buttons[key] = button
             group.addButton(button)
-            self._admin_nav_actions.append(bar.addWidget(button))
-        profile_menu = self.menuBar().addMenu("Perfiles")
-        active = QAction(f"Activo: {self.profile.name}", self)
-        active.setEnabled(False)
-        profile_menu.addAction(active)
-        profile_menu.addAction("Cambiar perfil…", self._switch_profile)
-        profile_menu.addAction("Administrar perfil…", self._admin_profile)
+            bar.addWidget(button)
+        toolbar_spacer = QWidget(bar)
+        toolbar_spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        bar.addWidget(toolbar_spacer)
+        global_controls = QWidget(bar)
+        global_layout = QHBoxLayout(global_controls)
+        global_layout.setContentsMargins(0, 0, 0, 0)
+        global_layout.setSpacing(14)
+        self.global_refresh_button = make_context_icon_button(
+            "refresh",
+            "Actualizar análisis",
+            global_controls,
+            icon_palette_key="texto2",
+        )
+        self.global_refresh_button.setObjectName("globalIconButton")
+        self.global_refresh_button.clicked.connect(self._global_reanalyze)
+        self.workspace_button = make_context_icon_button(
+            "workspace",
+            f"Espacio de trabajo: {self.profile.name}",
+            global_controls,
+            icon_palette_key="texto2",
+        )
+        self.workspace_button.setObjectName("globalIconButton")
+        self.workspace_button.clicked.connect(self._show_workspace_menu)
+        self.settings_button = make_context_icon_button(
+            "settings", "Configuración", global_controls, icon_palette_key="texto2"
+        )
+        self.settings_button.setObjectName("globalIconButton")
+        self.settings_button.clicked.connect(self._show_settings_menu)
+        global_layout.addWidget(self.global_refresh_button)
+        global_layout.addWidget(self.workspace_button)
+        global_layout.addWidget(self.settings_button)
+        bar.addWidget(global_controls)
 
         # Barra contextual con la misma composición
         # visual que la barra de contexto de Inicio (ver SummaryPanel).
@@ -1200,7 +1247,7 @@ class GiplerWindow(QMainWindow):
         filter_row.setObjectName("referenceControls")
         filter_row.setFrameShape(QFrame.Shape.NoFrame)
         fr = QHBoxLayout(filter_row)
-        fr.setContentsMargins(10, 8, 10, 8)
+        fr.setContentsMargins(10, 7, 10, 7)
         fr.setSpacing(12)
         self.axis_a_box = QComboBox()
         self.axis_a_box.addItems(AXIS_A)
@@ -1242,23 +1289,12 @@ class GiplerWindow(QMainWindow):
         self._sync_context_tooltip = (
             "Elementos visibles y seleccionados en la vista actual"
         )
-        self.search_button = QToolButton()
-        search_icon = QIcon.fromTheme("edit-find")
-        if search_icon.isNull():
-            self.search_button.setText("Buscar")
-        else:
-            self.search_button.setIcon(search_icon)
+        self.search_button = make_context_icon_button(
+            "search", "Buscar por nombre o ruta", self
+        )
         self.search_button.setCheckable(True)
         self.search_button.setAccessibleName("Mostrar u ocultar búsqueda")
-        self.search_button.setToolTip("Buscar por nombre o ruta")
         self.search_button.toggled.connect(self._toggle_search)
-        self.refresh_button = QToolButton()
-        self.refresh_button.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
-        )
-        self.refresh_button.setAccessibleName("Actualizar análisis")
-        self.refresh_button.setToolTip("Actualizar análisis")
-        self.refresh_button.clicked.connect(self.reanalyze)
         fr.addWidget(view_label)
         fr.addWidget(self.axis_a_box)
         fr.addWidget(filter_label)
@@ -1270,7 +1306,6 @@ class GiplerWindow(QMainWindow):
         sync_controls_layout.setSpacing(12)
         sync_controls_layout.addWidget(self.search_button)
         sync_controls_layout.addWidget(self.search_edit)
-        sync_controls_layout.addWidget(self.refresh_button)
         self.contextual_spacer = QWidget(filter_row)
         self.contextual_spacer.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Fixed
@@ -1296,6 +1331,16 @@ class GiplerWindow(QMainWindow):
             self._on_home_copy_selection_changed
         )
         self.inicio_panel.assign_requested.connect(self._assign_new_file)
+        self.inicio_panel.reference_changed.connect(
+            self._on_home_reference_changed
+        )
+        self.inicio_panel.copy_requested.connect(self._copy_row_to_destination)
+        self.inicio_panel.delete_requested.connect(
+            lambda row: self._delete_row(row, "home")
+        )
+        self.inicio_panel.discard_requested.connect(
+            lambda row: self._discard_row(row, "home")
+        )
         self.btn_execute = self.inicio_panel.btn_execute
         self.btn_execute.clicked.connect(self._execute_from_panel)
         self.btn_safe = self.inicio_panel.btn_safe
@@ -1373,6 +1418,74 @@ class GiplerWindow(QMainWindow):
         self.status.showMessage("Listo")
         self._show_inicio()
 
+    def _global_reanalyze(self) -> None:
+        if self._reanalyzing or self.is_executing:
+            return
+        from PySide6.QtWidgets import QMessageBox
+
+        self._reanalyzing = True
+        self.global_refresh_button.setEnabled(False)
+        self.status.showMessage("Actualizando análisis…")
+        QApplication.processEvents()
+        try:
+            message = self.reanalyze()
+        except Exception as exc:
+            QMessageBox.critical(self, "No se pudo actualizar", str(exc))
+            message = "Actualización fallida."
+        finally:
+            self._reanalyzing = False
+            self.global_refresh_button.setEnabled(True)
+        self.status.showMessage(message)
+
+    def _workspace_menu(self) -> QMenu:
+        menu = QMenu(self)
+        active = menu.addAction(
+            f"Espacio de trabajo activo: {self.profile.name}"
+        )
+        active.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Cambiar espacio de trabajo", self._switch_profile)
+        menu.addAction(
+            "Administrar espacios de trabajo", self._admin_profile
+        )
+        return menu
+
+    def _show_workspace_menu(self) -> None:
+        menu = self._workspace_menu()
+        menu.exec(
+            self.workspace_button.mapToGlobal(
+                QPoint(0, self.workspace_button.height())
+            )
+        )
+
+    def _settings_menu(self) -> QMenu:
+        from gipler.gui.about_dialog import AboutDialog
+        from gipler.gui.theme import load_preference
+
+        menu = QMenu(self)
+        appearance = menu.addMenu("Apariencia")
+        current = load_preference()
+        for theme, label in (("oscuro", "Oscuro"), ("claro", "Claro")):
+            action = appearance.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(theme == current)
+            action.triggered.connect(
+                lambda _checked=False, value=theme: self.apply_theme(value)
+            )
+        menu.addSeparator()
+        menu.addAction(
+            "Acerca de Gipler", lambda: AboutDialog(self).exec()
+        )
+        return menu
+
+    def _show_settings_menu(self) -> None:
+        menu = self._settings_menu()
+        menu.exec(
+            self.settings_button.mapToGlobal(
+                QPoint(0, self.settings_button.height())
+            )
+        )
+
     def apply_theme(self, theme: str) -> None:
         from gipler.gui import theme as th
 
@@ -1436,18 +1549,330 @@ class GiplerWindow(QMainWindow):
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(directory))):
             self.status.showMessage(f"No se pudo abrir el directorio: {directory}")
 
+    def _copy_row_to_destination(
+        self, row, direction: str = "to_reference"
+    ) -> None:
+        """Copy one row through the existing selection/review/authorization flow."""
+        if self.profile_analysis is None:
+            return
+        reverse = direction == "to_dev"
+        if reverse:
+            from gipler.copy_policy import describe_blockers, reverse_row_blockers
+
+            key = (
+                (row.destination, row.path)
+                if row.destination and row.path
+                else None
+            )
+            blockers = reverse_row_blockers(row)
+            if key is None or blockers:
+                detail = (
+                    "; ".join(describe_blockers(blockers))
+                    if blockers
+                    else "El archivo no tiene una referencia de copia válida."
+                )
+                self.status.showMessage(
+                    f"No se puede copiar «{row.path}»: {detail}"
+                )
+                return
+            before = set(self.selection_ctrl.keys)
+            self.selection_ctrl.keys = {key}
+            self._after_selection_change(before)
+            self.prepare_operations(
+                show_dialog=True,
+                direction="to_dev",
+                operation_rows=[row],
+            )
+            return
+        key = selection_key_for(row)
+        if key is None:
+            self.status.showMessage("El archivo no tiene una referencia de copia válida.")
+            return
+        self._refresh_copy_eligibility()
+        if key not in (self._eligible_copy_keys or set()):
+            from gipler.copy_policy import describe_blockers
+
+            blockers = getattr(row, "copy_blockers", ())
+            detail = "; ".join(describe_blockers(blockers)) if blockers else (
+                "El archivo no es elegible para copia."
+            )
+            self.status.showMessage(f"No se puede copiar «{row.path}»: {detail}")
+            return
+        before = set(self.selection_ctrl.keys)
+        self.selection_ctrl.keys = {key}
+        self._after_selection_change(before)
+        self.prepare_operations(show_dialog=True)
+
+    def _delete_target(self, row, side: str):
+        dev_root = self.meta.get("dev", "")
+        repo_root = self._repo_root_for(row.destination)
+        root = ""
+        if side == "dev":
+            root = dev_root
+        elif side == "repo":
+            root = repo_root
+        else:
+            dev_path = (
+                os.path.join(dev_root, *row.path.split("/")) if dev_root else ""
+            )
+            root = dev_root if dev_path and os.path.lexists(dev_path) else repo_root
+        if not root:
+            return None
+        absolute = os.path.abspath(os.path.join(root, *row.path.split("/")))
+        try:
+            if os.path.commonpath((os.path.abspath(root), absolute)) != os.path.abspath(root):
+                return None
+        except ValueError:
+            return None
+        return root, absolute
+
+    def _git_target(self, row, side: str):
+        root = self.meta.get("dev", "") if side == "dev" else self._repo_root_for(row.destination)
+        if not root:
+            return None
+        return root, row.path
+
+    @staticmethod
+    def _file_signature(path: str):
+        st = os.lstat(path)
+        link = os.readlink(path) if os.path.islink(path) else ""
+        return (st.st_mode, st.st_size, st.st_mtime_ns, st.st_ino, st.st_nlink, link)
+
+    @staticmethod
+    def _git_file_status(root: str, relative: str):
+        if not root or not os.path.lexists(os.path.join(root, ".git")):
+            return None
+        try:
+            from gipler.git_integration import git_status_files
+
+            return next(
+                (
+                    item
+                    for item in git_status_files(root)
+                    if item.path == relative
+                ),
+                None,
+            )
+        except Exception:
+            return None
+
+    def _delete_row(self, row, side: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        target = self._delete_target(row, side)
+        if target is None:
+            self.status.showMessage(f"No se encontró la copia física de «{row.path}».")
+            return
+        root, absolute = target
+        if not os.path.lexists(absolute):
+            self.status.showMessage(f"El archivo ya no existe: {absolute}")
+            return
+        if os.path.isdir(absolute) and not os.path.islink(absolute):
+            self.status.showMessage("Los directorios no se eliminan desde este menú.")
+            return
+        try:
+            signature = self._file_signature(absolute)
+            st = os.lstat(absolute)
+        except OSError as exc:
+            self.status.showMessage(f"No se pudo leer el archivo: {exc}")
+            return
+        kind = (
+            "enlace simbólico"
+            if os.path.islink(absolute)
+            else "directorio"
+            if os.path.isdir(absolute)
+            else "archivo"
+        )
+        entry = next(
+            (
+                item
+                for item in self.profile_analysis.entries
+                if item.path == row.path
+            ),
+            None,
+        )
+        assignment = self.profile.assignments.get(row.path, "")
+        status = self._git_file_status(root, row.path)
+        details = [
+            f"Archivo: {row.path}",
+            f"Ruta completa: {absolute}",
+            f"Directorio afectado: {root}",
+            f"Tipo: {kind}",
+            f"Tamaño: {st.st_size} bytes",
+            f"Enlaces duros: {st.st_nlink}",
+            f"Enlace simbólico: {os.readlink(absolute) if os.path.islink(absolute) else 'no'}",
+            f"Estado Git: {status.status_label if status is not None else 'no disponible'}",
+            f"Pertenencia: {entry.membership.state.value if entry is not None else 'no disponible'}",
+            "Referencias: "
+            + (
+                ", ".join(entry.membership.source_ids)
+                if entry is not None and entry.membership.source_ids
+                else "ninguna"
+            ),
+            f"Asignación: {assignment or 'ninguna'}",
+            "",
+            "Consecuencias:",
+            "Se eliminará únicamente esta copia física.",
+            "El inventario y la comparación se recalcularán.",
+            "No se modifican asignaciones, baselines ni otras copias.",
+        ]
+        if st.st_nlink > 1:
+            details.append(
+                "El archivo tiene varios enlaces duros; eliminar este nombre no borra los demás."
+            )
+        if os.path.islink(absolute):
+            details.append(
+                "Se elimina el enlace simbólico, no el archivo al que apunta."
+            )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Eliminar archivo")
+        box.setText(f"Eliminar «{row.path}»")
+        box.setInformativeText("Revise los detalles antes de autorizar.")
+        box.setDetailedText("\n".join(details))
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok
+        )
+        box.button(QMessageBox.StandardButton.Ok).setText("Autorizar eliminación")
+        if box.exec() != QMessageBox.StandardButton.Ok:
+            return
+        if QMessageBox.question(
+            self,
+            "Confirmar eliminación",
+            f"¿Eliminar definitivamente «{row.path}» de {root}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            if self._file_signature(absolute) != signature:
+                QMessageBox.warning(
+                    self,
+                    "Archivo modificado",
+                    "El archivo cambió después de la revisión; no se eliminó.",
+                )
+                return
+            os.unlink(absolute)
+        except OSError as exc:
+            QMessageBox.critical(self, "No se pudo eliminar", str(exc))
+            return
+        self.status.showMessage(f"Eliminado: {absolute}")
+        self.reanalyze()
+
+    def _discard_row(self, row, side: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        target = self._git_target(row, side)
+        if target is None:
+            self.status.showMessage("No hay un repositorio Git asociado.")
+            return
+        root, relative = target
+        status = self._git_file_status(root, relative)
+        if status is None:
+            self.status.showMessage("No se pudo determinar el estado Git del archivo.")
+            return
+        if status.conflict:
+            self.status.showMessage("Conflicto sin resolver: descarte bloqueado.")
+            return
+        if status.untracked or status.ignored:
+            self.status.showMessage("El archivo no es un cambio de HEAD.")
+            return
+        if not (status.staged or status.unstaged):
+            self.status.showMessage("El archivo no tiene cambios que descartar.")
+            return
+        staged = status.staged
+        details = [
+            f"Archivo: {relative}",
+            f"Repositorio: {root}",
+            f"Estado Git: {status.status_label}",
+            f"Índice preparado: {'sí' if status.staged else 'no'}",
+            f"Árbol de trabajo modificado: {'sí' if status.unstaged else 'no'}",
+            "",
+            "Consecuencias:",
+            "Se restaurará el contenido desde HEAD.",
+            "Se descartarán los cambios locales de este archivo.",
+            "No se usa git reset --hard.",
+            "No se modifican commits ni otros archivos.",
+        ]
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Descartar cambios de Git")
+        box.setText(f"Descartar cambios de «{relative}»")
+        box.setInformativeText("Revise los detalles antes de autorizar.")
+        box.setDetailedText("\n".join(details))
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok
+        )
+        box.button(QMessageBox.StandardButton.Ok).setText("Autorizar descarte")
+        if box.exec() != QMessageBox.StandardButton.Ok:
+            return
+        if QMessageBox.question(
+            self,
+            "Confirmar descarte",
+            f"¿Descartar definitivamente los cambios de «{relative}»?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        current = self._git_file_status(root, relative)
+        if current is None or (
+            current.conflict,
+            current.untracked,
+            current.ignored,
+            current.staged,
+            current.unstaged,
+        ) != (
+            status.conflict,
+            status.untracked,
+            status.ignored,
+            status.staged,
+            status.unstaged,
+        ):
+            QMessageBox.warning(
+                self,
+                "Estado Git cambiado",
+                "El estado del archivo cambió después de la revisión; no se descartó nada.",
+            )
+            return
+        try:
+            from gipler.git_integration import git_discard_file
+
+            git_discard_file(root, relative, staged=staged)
+        except Exception as exc:
+            QMessageBox.critical(self, "No se pudo descartar", str(exc))
+            return
+        self.status.showMessage(f"Cambios descartados: {relative}")
+        self.reanalyze()
+
     def _show_inicio(self) -> None:
         self.stacked.setCurrentWidget(self.inicio_panel)
-        # Estado visual coherente desde el arranque: Inicio marcada y
-        # destinos desmarcados (index 0 = Inicio).
-        if getattr(self, "nav_buttons", None) and "inicio" in self.nav_buttons:
-            self.nav_buttons["inicio"].setChecked(True)
-        for b in getattr(self, "repo_buttons", {}).values():
-            b.setChecked(False)
-        for b in getattr(self, "admin_buttons", {}).values():
-            b.setChecked(False)
+        for name, button in getattr(self, "nav_buttons", {}).items():
+            button.setChecked(name == "inicio")
+        for button in getattr(self, "admin_buttons", {}).values():
+            button.setChecked(False)
         self.status.showMessage("Inicio: resumen global (solo lectura, sin cambios)")
         self._refresh_active_git_bar()
+
+    def _show_diferencias(self) -> None:
+        self.stacked.setCurrentWidget(self.compare_page)
+        for name, button in getattr(self, "nav_buttons", {}).items():
+            button.setChecked(name == "diferencias")
+        for button in getattr(self, "admin_buttons", {}).values():
+            button.setChecked(False)
+        self.set_destination(self._destination)
+        self.status.showMessage(
+            f"Diferencias: {self._reference_title(self._destination)} · "
+            f"seleccionados: {len(self.selection_ctrl)}"
+        )
+        self._refresh_active_git_bar()
+
+    def _on_home_reference_changed(self, reference_id: str) -> None:
+        if reference_id == self._destination:
+            return
+        if reference_id not in self._reference_ids():
+            self._update_summary()
+            return
+        self.set_destination(reference_id)
 
     def _show_profile_admin(self, key: str) -> None:
         page = self._profile_admin_pages.get(key)
@@ -1456,7 +1881,7 @@ class GiplerWindow(QMainWindow):
         self.stacked.setCurrentWidget(page)
         for name, button in self.admin_buttons.items():
             button.setChecked(name == key)
-        for button in self.repo_buttons.values():
+        for button in getattr(self, "nav_buttons", {}).values():
             button.setChecked(False)
         self.status.showMessage(
             "Archivos excluidos del perfil" if key == "excluidos"
@@ -1509,6 +1934,16 @@ class GiplerWindow(QMainWindow):
                     else ()
                 ),
                 targets=self._assignment_targets(),
+                included=(
+                    self.profile_analysis.inventory.included
+                    if key == "excluidos"
+                    else ()
+                ),
+                all_entries=(
+                    self.profile_analysis.entries
+                    if key == "indeterminados"
+                    else ()
+                ),
             )
             page.selected.connect(self._inspect_profile_entry)
             page.activated.connect(self._activate_profile_entry)
@@ -1705,28 +2140,9 @@ class GiplerWindow(QMainWindow):
             f"«{path}» asignado a {target_name} (sin copia; decisión de pertenencia)"
         )
 
-    def _show_compare(self, dest: str | None = None) -> None:
-        """Muestra la página de comparación preservando selección y ops_cache."""
-        sent = getattr(self, "stacked", None)
-        if sent is None:
-            return
-        page = sent.widget(1)
-        sent.setCurrentWidget(page)
-        if dest is not None:
-            for name, b in self.repo_buttons.items():
-                b.setChecked(name == dest)
-        self._refresh_active_git_bar()
-        self.status.showMessage(f"Vista: {self._destination} · seleccionados: {len(self.selection_ctrl)}")
-
-    def _on_repo(self, button: str) -> None:
-        for name, b in self.repo_buttons.items():
-            b.setChecked(name == button)
-        self.set_destination(button)
-        self._show_compare(button)
-
     # Accesores estables para los tests.
     def repo_names(self) -> list[str]:
-        return list(self.repo_buttons.keys())
+        return sorted(self._reference_ids())
 
     def panels(self) -> tuple[ComparisonPanel, ComparisonPanel]:
         return self.dev_panel, self.dest_panel
@@ -1822,7 +2238,7 @@ class GiplerWindow(QMainWindow):
             self.inicio_panel.set_destinations(
                 [
                     (source.id, source.name)
-                    for source in sorted(self.profile.sources, key=lambda source: source.order)
+                    for source in self._reference_sources()
                 ],
                 self._destination,
             )
@@ -1998,18 +2414,27 @@ class GiplerWindow(QMainWindow):
                 self.ops_cache,
             )
 
-    def prepare_operations(self, show_dialog: bool = False) -> list:
+    def prepare_operations(
+        self,
+        show_dialog: bool = False,
+        *,
+        direction: str = "to_reference",
+        operation_rows=None,
+    ) -> list:
         """Una única llamada a build_operations; guarda ops_cache y
         muestra la vista previa. Sin escrituras."""
         from gipler.copy_engine import build_operations
         from gipler.gui.operations_dialog import OperationsDialog
-        operation_rows = self.profile_analysis.copy_rows()
+        if operation_rows is None:
+            operation_rows = self.profile_analysis.copy_rows()
+        else:
+            operation_rows = list(operation_rows)
         repos = self.profile_analysis.destination_roots
         excluded_keys = {
             key
             for row in operation_rows
             if "excluded" in row.incidences
-            if (key := selection_key_for(row)) is not None
+            if (key := selection_key_for(row) or (row.destination, row.path)) is not None
         }
         token = object()
         self._prepared_token = token
@@ -2020,10 +2445,14 @@ class GiplerWindow(QMainWindow):
             self.meta.get("dev", ""),
             repos,
             self.snapshot,
+            direction=direction,
         )
+        sync_eligible = set(self._eligible_copy_keys or set())
+        if direction == "to_dev":
+            sync_eligible.update(self.selection_ctrl.keys)
         self.inicio_panel.sync_operational_state(
             self.selection_ctrl.keys,
-            self._eligible_copy_keys or set(),
+            sync_eligible,
             self.ops_cache,
         )
         counts = {"copiable": 0, "bloqueada": 0, "identica": 0}
@@ -2049,7 +2478,7 @@ class GiplerWindow(QMainWindow):
         self._invalidate_review()
         self.inicio_panel.sync_operational_state(
             self.selection_ctrl.keys,
-            self._eligible_copy_keys or set(),
+            sync_eligible,
             self.ops_cache,
         )
         return self.ops_cache
@@ -2081,8 +2510,12 @@ class GiplerWindow(QMainWindow):
         self._copy_thread.start()
 
     def _set_actions_enabled(self, enabled: bool) -> None:
-        for b in (getattr(self, "btn_safe", None), getattr(self, "btn_prepare", None),
-                  getattr(self, "btn_execute", None), getattr(self, "btn_refresh", None)):
+        for b in (
+            getattr(self, "btn_safe", None),
+            getattr(self, "btn_prepare", None),
+            getattr(self, "btn_execute", None),
+            getattr(self, "global_refresh_button", None),
+        ):
             if b is not None:
                 b.setEnabled(enabled)
 
@@ -2146,7 +2579,7 @@ class GiplerWindow(QMainWindow):
         self.proxy.dev_root = self.meta["dev"]
         self.repo_proxy.dev_root = self.meta["dev"]
         self._refresh_profile_admin_pages()
-        self._rebuild_profile_destinations()
+        self._refresh_reference_context()
         self._invalidate_review()
         self._eligible_copy_keys = None
         self.tree_model.set_rows(self.rows, self._destination)
@@ -2176,43 +2609,16 @@ class GiplerWindow(QMainWindow):
             "se requiere nueva revisión para copiar"
         )
 
-    def _rebuild_profile_destinations(self) -> None:
+    def _refresh_reference_context(self) -> None:
         if self.profile is None:
             return
-        current = self._destination
-        for button in self.repo_buttons.values():
-            self.nav_group.removeButton(button)
-            for action in self.nav_toolbar.actions():
-                if action.defaultWidget() is button:
-                    self.nav_toolbar.removeAction(action)
-                    break
-            button.deleteLater()
-        self.repo_buttons.clear()
-        sources = sorted(self.profile.sources, key=lambda source: source.order)
-        for source in sources:
-            button = EditorialNavButton(
-                source.name if source.enabled else f"{source.name} (desactivada)"
+        references = self._reference_sources()
+        if self._destination not in {source.id for source in references}:
+            self._destination = (
+                references[0].id if references else "sin determinar"
             )
-            button.setCheckable(True)
-            button.setEnabled(source.enabled)
-            button.clicked.connect(
-                lambda _checked=False, source_id=source.id: self._on_repo(button=source_id)
-            )
-            self.repo_buttons[source.id] = button
-            self.nav_group.addButton(button)
-            self.nav_toolbar.insertWidget(self._admin_nav_actions[0], button)
-        current_source = self.profile.source(current)
-        if current not in self.repo_buttons or current_source is None or not current_source.enabled:
-            self._destination = next(
-                (source.id for source in sources if source.enabled),
-                "sin determinar",
-            )
-        for source_id, button in self.repo_buttons.items():
-            button.setChecked(source_id == self._destination)
         self._sync_git_bars()
         self.set_destination(self._destination)
-        if self._destination == "sin determinar":
-            self._show_inicio()
 
     def _switch_profile(self) -> None:
         from PySide6.QtWidgets import QDialog
@@ -2259,7 +2665,9 @@ class GiplerWindow(QMainWindow):
             profile = load_profile(profile_id) if profile_id else None
             window = GiplerWindow(profile=profile)
         except (OSError, ValueError) as exc:
-            QMessageBox.critical(self, "No se pudo abrir el perfil", str(exc))
+            QMessageBox.critical(
+                self, "No se pudo abrir el espacio de trabajo", str(exc)
+            )
             return
         window.show()
         QApplication.instance()._gipler_window = window
@@ -2283,12 +2691,10 @@ class GiplerWindow(QMainWindow):
         self._update_profile_menu_label()
 
     def _update_profile_menu_label(self) -> None:
-        for action in self.menuBar().actions():
-            if action.text() == "Perfiles" and action.menu():
-                actions = action.menu().actions()
-                if actions:
-                    actions[0].setText(f"Activo: {self.profile.name}")
-                break
+        if hasattr(self, "workspace_button"):
+            self.workspace_button.setToolTip(
+                f"Espacio de trabajo: {self.profile.name}"
+            )
 
     def _change_profile_work_dir(self) -> None:
         from PySide6.QtWidgets import QFileDialog, QMessageBox
@@ -2560,9 +2966,9 @@ def create_application() -> QApplication:
     app = QApplication.instance() or QApplication([])
     app.setApplicationName("Gipler")
     app.setDesktopFileName("gipler")
-    icon = _app_icon()
-    if icon:
-        app.setWindowIcon(QIcon(icon))
+    icon = application_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     return app
 
 

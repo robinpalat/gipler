@@ -84,6 +84,10 @@ class SummaryPanel(QFrame):
     copy_selection_changed = Signal(object, bool)
     # (ruta relativa, id de referencia) — decisión de pertenencia, nunca copia.
     assign_requested = Signal(str, str)
+    reference_changed = Signal(str)
+    copy_requested = Signal(object)
+    delete_requested = Signal(object)
+    discard_requested = Signal(object)
 
     RELEVANT = ("new_in_dev", "modified_in_dev", "missing_in_dev", "not_comparable")
     WARNING_STATES = ("tracked_modified",)
@@ -143,11 +147,11 @@ class SummaryPanel(QFrame):
         context_layout = QHBoxLayout(context)
         context_layout.setContentsMargins(10, 8, 10, 8)
         context_layout.setSpacing(12)
-        repository_label = QLabel("Repositorio")
+        repository_label = QLabel("Directorio de referencia")
         repository_label.setBuddy(self.repository_selector)
         repository_label.setAccessibleName("Etiqueta de repositorio")
         repository_label.setObjectName("contextLabel")
-        self.repository_selector.setAccessibleName("Repositorio de Inicio")
+        self.repository_selector.setAccessibleName("Directorio de referencia de Inicio")
         context_layout.addWidget(repository_label)
         context_layout.addWidget(self.repository_selector, 1)
         view_label = QLabel("Vista")
@@ -174,6 +178,7 @@ class SummaryPanel(QFrame):
         self._visual_theme = ""
         self._visual_theme_pending = ""
         self._assignment_targets = []
+        self._destination_names: dict[str, str] = {}
         self._assign_buttons = {}
         self._assign_combos = {}
         self.assign_box = QFrame()
@@ -720,6 +725,9 @@ QPushButton:disabled {{ background: {palette['panel2']}; color: {palette['texto2
 
     def _on_repository_changed(self, _index: int) -> None:
         self.update_from(self._rows, self._ops_cache)
+        reference_id = self.repository_selector.currentData()
+        if reference_id:
+            self.reference_changed.emit(str(reference_id))
 
     def _on_view_changed(self, _index: int) -> None:
         self.update_from(self._rows, self._ops_cache)
@@ -822,6 +830,10 @@ QPushButton:disabled {{ background: {palette['panel2']}; color: {palette['texto2
     def set_destinations(
         self, destinations: list[tuple[str, str]], selected: str | None = None
     ) -> None:
+        self._destination_names = {
+            str(destination_id): str(label)
+            for destination_id, label in destinations
+        }
         self.repository_selector.blockSignals(True)
         self.repository_selector.clear()
         for destination_id, label in destinations:
@@ -846,13 +858,44 @@ QPushButton:disabled {{ background: {palette['panel2']}; color: {palette['texto2
         if row is None:
             return None
         menu = QMenu(self)
+        copy_action = menu.addAction(
+            f"Copiar a {self._destination_name(row.destination)}"
+        )
+        copy_action.setEnabled(selection_key_for(row) is not None)
+        copy_action.triggered.connect(lambda: self.copy_requested.emit(row))
         select_action = menu.addAction("Seleccionar")
         select_action.triggered.connect(lambda: self.list.setCurrentItem(item))
         open_action = menu.addAction("Abrir en explorador")
         open_action.triggered.connect(lambda: self.explorer_requested.emit(row))
         exclude_action = menu.addAction("Excluir")
         exclude_action.triggered.connect(lambda: self.exclude_requested.emit(row))
+        menu.addSeparator()
+        if self._discard_candidate(row):
+            discard_action = menu.addAction("Descartar cambios de Git…")
+            discard_action.triggered.connect(
+                lambda: self.discard_requested.emit(row)
+            )
+        delete_action = menu.addAction("Eliminar…")
+        delete_action.triggered.connect(lambda: self.delete_requested.emit(row))
         return menu
+
+    def _destination_name(self, destination_id: str) -> str:
+        root = self.repo_roots.get(destination_id, "")
+        if root:
+            name = os.path.basename(os.path.normpath(root))
+            if name:
+                return name
+        return self._destination_names.get(destination_id, destination_id)
+
+    @staticmethod
+    def _discard_candidate(row) -> bool:
+        statuses = set(getattr(row, "git_statuses", ()) or ())
+        return bool(
+            row.axis_b == "tracked_modified"
+            or getattr(row, "git_change", "")
+            or getattr(row, "git_stage", "")
+            or statuses & {"modified_unstaged", "staged"}
+        )
 
     def _update_execute_label(self, ops_cache: list) -> None:
         if self.btn_execute is not None:

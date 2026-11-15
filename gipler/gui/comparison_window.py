@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from gipler.comparator import make_diff
 from gipler.gui.diff_view import DiffViewer
+from gipler.gui.identity import apply_window_icon
 from gipler.report import Row
 
 
@@ -87,6 +88,7 @@ def _geometry_is_usable(rect: QRect, area: QRect) -> bool:
 class ComparisonWindow(QMainWindow):
     def __init__(self, row: Row, dev_root: str, repo_root: str, parent=None):
         super().__init__(parent)
+        apply_window_icon(self)
         self.row = row
         self.dev_root = dev_root
         self.repo_root = repo_root

@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from gipler.gui import icons
-from gipler.gui.styles import make_context_label
+from gipler.gui.styles import make_context_icon_button, make_context_label
 from gipler.gui.ssh_support import configure_askpass
 
 from gipler.git_integration import (
@@ -760,19 +760,11 @@ class GitBar(QWidget):
     def _action_button(
         self, icon_name: str, tooltip: str, slot, icon_size: int = 18
     ) -> QToolButton:
-        button = QToolButton(self)
-        button.setIcon(icons.icon(icon_name))
-        button.setIconSize(QSize(icon_size, icon_size))
-        button.setToolTip(tooltip)
-        button.setAccessibleName(tooltip)
-        button.setAutoRaise(True)
-        button.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        button.setFixedSize(28, 28)
-        button.setStyleSheet(
-            "QToolButton { border: none; background: transparent; padding: 0px; }"
-            " QToolButton:hover { background: rgba(127, 127, 127, 0.12);"
-            " border-radius: 4px; }"
-            " QToolButton:pressed { background: rgba(127, 127, 127, 0.18); }"
+        button = make_context_icon_button(
+            icon_name,
+            tooltip,
+            self,
+            icon_size=icon_size,
         )
         button.clicked.connect(slot)
         return button

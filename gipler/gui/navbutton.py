@@ -27,13 +27,13 @@ class EditorialNavButton(QPushButton):
         )
 
     def _text_width(self) -> int:
-        """Ancho del texto con la fuente realmente pintada: el botón activo
-        se destaca en negrita y +0.5 pt, y su texto es más ancho."""
+        """Ancho máximo entre el estado normal y el activo."""
         font = QFont(self.font())
-        if self.isChecked():
-            font.setBold(True)
-            font.setPointSize(self.font().pointSize() + 0.5)
-        return QFontMetrics(font).horizontalAdvance(self.text())
+        normal = QFontMetrics(font).horizontalAdvance(self.text())
+        active = QFont(font)
+        active.setBold(True)
+        active.setPointSize(self.font().pointSize() + 0.5)
+        return max(normal, QFontMetrics(active).horizontalAdvance(self.text()))
 
     def sizeHint(self) -> QSize:
         return QSize(self._text_width() + self.TEXT_PADDING, self.HEIGHT)

@@ -369,7 +369,10 @@ class DesktopResourcesTests(unittest.TestCase):
     def test_packaged_assets_exist(self):
         from gipler import resources
 
+        self.assertEqual(os.path.basename(resources.master_icon()), "gipler_solid.png")
+        self.assertEqual(resources.master_icon(), resources.solid_icon())
         self.assertTrue(os.path.isfile(resources.master_icon()))
+        self.assertTrue(os.path.isfile(resources.trans_icon()))
         self.assertTrue(os.path.isfile(resources.ico_path()))
         sizes = resources.available_sizes()
         for size in (16, 32, 48, 128, 256, 512):

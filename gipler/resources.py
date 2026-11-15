@@ -14,10 +14,25 @@ ASSETS = os.path.dirname(os.path.abspath(__file__)) + os.sep + "assets"
 APP_ID = "gipler"
 WINDOW_CLASS = "Gipler"
 
+# Identidad visual aprobada. Solid es la fuente principal para la aplicación;
+# Trans se conserva para documentación y materiales editoriales.
+SOLID_ICON_NAME = "gipler_solid.png"
+TRANS_ICON_NAME = "gipler_trans.png"
+
+
+def solid_icon() -> str:
+    """Icono maestro con fondo (identidad principal de la aplicación)."""
+    return os.path.join(ASSETS, SOLID_ICON_NAME)
+
+
+def trans_icon() -> str:
+    """Icono maestro transparente (documentación y materiales editoriales)."""
+    return os.path.join(ASSETS, TRANS_ICON_NAME)
+
 
 def master_icon() -> str:
-    """Icono maestro (original a máxima resolución)."""
-    return os.path.join(ASSETS, "gipler.png")
+    """Icono principal usado por la aplicación, ventanas y escritorio."""
+    return solid_icon()
 
 
 def ico_path() -> str:

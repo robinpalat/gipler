@@ -24,6 +24,7 @@ from gipler.gui import icons
 from gipler.gui.git_bar import ElidedLabel
 
 from gipler.gui.models.filter_model import FilterModel
+from gipler.selection import selection_key_for
 
 DEV_HEADERS = ("Nombre", "Estado del destino", "Advertencias")
 REPO_HEADERS = ("Nombre", "Estado Git", "Advertencias")
@@ -94,6 +95,9 @@ class PanelProxy(FilterModel):
 
 class ComparisonPanel(QWidget):
     exclude_requested = Signal(str)
+    copy_requested = Signal(object, str)
+    delete_requested = Signal(object, str)
+    discard_requested = Signal(object, str)
     select_all_commit_changed = Signal(int)
     commit_requested = Signal()
     commit_confirmed = Signal(str)
@@ -132,6 +136,8 @@ class ComparisonPanel(QWidget):
         self.tree = QTreeView()
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._open_context_menu)
+        if not self.is_dev:
+            self.tree.setObjectName("referenceTree")
         self.tree.setColumnWidth(0, 420)
         self.tree.setColumnWidth(1, 170)
         self.tree.setColumnWidth(2, 220)
@@ -351,7 +357,7 @@ class ComparisonPanel(QWidget):
             src = index
         src_model = getattr(model, "sourceModel", lambda: model)() if hasattr(model, "sourceModel") else model
         node = src_model.node_at(src)
-        return None if node is None else (node.path, node.is_dir)
+        return None if node is None else (node.path, node.is_dir, node.row)
 
     def _open_context_menu(self, pos) -> None:
         index = self.tree.indexAt(pos)
@@ -360,11 +366,68 @@ class ComparisonPanel(QWidget):
             resolved = self._resolve(index)
             if resolved is None:
                 return
-            rel, is_dir = resolved
+            rel, is_dir, row = resolved
+            side = "dev" if self.is_dev else "repo"
+            if not is_dir and row is not None:
+                copy_action = menu.addAction(
+                    f"Copiar a {self._copy_target_name(row, side)}"
+                )
+                copy_key = (
+                    selection_key_for(row)
+                    if side == "dev"
+                    else self._reverse_copy_key(row)
+                )
+                copy_action.setEnabled(copy_key is not None)
+                copy_action.triggered.connect(
+                    lambda: self.copy_requested.emit(row, side)
+                )
             open_action = menu.addAction("Abrir en explorador")
             open_action.triggered.connect(lambda: self._open_in_explorer(rel, is_dir))
             menu.addAction("Excluir").triggered.connect(lambda: self.exclude_requested.emit(rel))
+            if not is_dir and row is not None:
+                menu.addSeparator()
+                if self._discard_candidate(row):
+                    discard_action = menu.addAction("Descartar cambios de Git…")
+                    discard_action.triggered.connect(
+                        lambda: self.discard_requested.emit(row, side)
+                    )
+                delete_action = menu.addAction("Eliminar…")
+                delete_action.triggered.connect(
+                    lambda: self.delete_requested.emit(row, side)
+                )
             menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _copy_target_name(self, row, side: str) -> str:
+        win = self.window()
+        if side == "repo":
+            root = getattr(win, "meta", {}).get("dev", "")
+        elif hasattr(win, "_repo_root_for"):
+            root = win._repo_root_for(row.destination)
+        else:
+            root = ""
+        if root:
+            name = os.path.basename(os.path.normpath(root))
+            if name:
+                return name
+        return "Dev" if side == "repo" else (row.destination or "referencia")
+
+    @staticmethod
+    def _reverse_copy_key(row):
+        if row.axis_a not in ("modified_in_dev", "missing_in_dev"):
+            return None
+        if not row.destination or not row.path:
+            return None
+        return row.destination, row.path
+
+    @staticmethod
+    def _discard_candidate(row) -> bool:
+        statuses = set(getattr(row, "git_statuses", ()) or ())
+        return bool(
+            row.axis_b == "tracked_modified"
+            or getattr(row, "git_change", "")
+            or getattr(row, "git_stage", "")
+            or statuses & {"modified_unstaged", "staged"}
+        )
 
     def _explorer_base(self) -> str:
         base_root = getattr(self, "base_root", "")

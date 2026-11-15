@@ -50,6 +50,19 @@ class EmbeddedIconTests(unittest.TestCase):
             icons.icon("does-not-exist")
 
 
+class ApplicationIdentityTests(unittest.TestCase):
+    def test_top_level_dialogs_use_solid_application_icon(self):
+        from gipler.gui.about_dialog import AboutDialog
+        from gipler.gui.identity import application_icon
+        from gipler.gui.operations_dialog import OperationsDialog
+
+        expected = application_icon()
+        self.assertFalse(expected.isNull())
+        for dialog in (AboutDialog(), OperationsDialog()):
+            self.assertEqual(dialog.windowIcon().cacheKey(), expected.cacheKey())
+            dialog.deleteLater()
+
+
 class SshSupportTests(unittest.TestCase):
     def test_existing_askpass_is_preserved(self):
         env = {

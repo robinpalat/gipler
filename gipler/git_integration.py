@@ -743,3 +743,87 @@ def run_operation(
         returncode=result.returncode,
         refresh_comparison=ok and kind in ("pull", "commit"),
     )
+
+
+def git_discard_file(
+    repository: str,
+    path: str,
+    *,
+    staged: bool = False,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> GitOperationResult:
+    """Discard one tracked path without touching other files or commits.
+
+    Uses ``git restore`` only. Conflicts, untracked/ignored paths and
+    renames are rejected before any write.
+    """
+    detected = detect_repository(repository)
+    if detected is None:
+        raise GitError("El directorio ya no es un repositorio Git válido.")
+    git = _git_executable()
+    if git is None:
+        raise GitError("No se encontró el ejecutable Git en el sistema.")
+    root = detected.path
+    relative = path.replace(os.sep, "/").strip("/")
+    absolute = os.path.abspath(os.path.join(root, *relative.split("/")))
+    if os.path.commonpath((root, absolute)) != root:
+        raise GitError("La ruta queda fuera del repositorio.")
+
+    files = {item.path: item for item in git_status_files(root, timeout=timeout)}
+    current = files.get(relative)
+    if current is None:
+        raise GitError("El archivo ya no está registrado en Git.")
+    if current.conflict:
+        raise GitError("Conflicto sin resolver: el descarte genérico está bloqueado.")
+    if current.untracked:
+        raise GitError("Archivo sin seguimiento: no se descarta como cambio de HEAD.")
+    if current.ignored:
+        raise GitError("Archivo ignorado: no hay cambios de HEAD que descartar.")
+    if not (current.staged or current.unstaged):
+        raise GitError("El archivo no tiene cambios que descartar.")
+
+    for extra in ([], ["--cached"]):
+        result = _run_sync(
+            [git, "-C", root, "diff", *extra, "--name-status", "-M", "--", relative],
+            timeout=timeout,
+            env=_environment(optional_locks=True),
+        )
+        if result.returncode == 0 and any(
+            line.startswith(("R", "C"))
+            for line in result.stdout.splitlines()
+            if line
+        ):
+            raise GitError(
+                "Renombrado o copiado detectado: el descarte no puede delimitarse con seguridad."
+            )
+
+    in_head = _run_sync(
+        [git, "-C", root, "cat-file", "-e", f"HEAD:{relative}"],
+        timeout=timeout,
+        env=_environment(optional_locks=True),
+    )
+    if in_head.returncode != 0:
+        raise GitError("El archivo no existe en HEAD; no se descarta automáticamente.")
+
+    args = [git, "-C", root, "restore", "--source=HEAD", "--worktree"]
+    if staged:
+        args.append("--staged")
+    args.extend(["--", relative])
+    result = _run_sync(args, timeout=timeout, env=_environment())
+    if result.returncode != 0:
+        raise GitError(
+            friendly_error("discard", result.stderr, result.stdout, result.returncode),
+            stdout=result.stdout,
+            stderr=result.stderr,
+            returncode=result.returncode,
+        )
+    return GitOperationResult(
+        kind="discard",
+        repository=root,
+        ok=True,
+        message="Cambios de Git descartados.",
+        stdout=result.stdout,
+        stderr=result.stderr,
+        returncode=result.returncode,
+        refresh_comparison=True,
+    )

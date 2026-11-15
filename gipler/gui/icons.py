@@ -50,6 +50,26 @@ SVG_ICONS: dict[str, str] = {
 <g {_STROKE}>
 <path d="M3.5 7.5A1.5 1.5 0 0 1 5 6h5l2 2h7a1.5 1.5 0 0 1 1.5 1.5v8A1.5 1.5 0 0 1 19 19H5a1.5 1.5 0 0 1-1.5-1.5Z"/>
 </g></svg>''',
+    "file": f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+<g {_STROKE}>
+<path d="M6 3.5h7l5 5v12H6Z"/><path d="M13 3.5v5h5"/>
+</g></svg>''',
+    "search": f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+<g {_STROKE}>
+<circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 4.5 4.5"/>
+</g></svg>''',
+    "refresh": f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+<g {_STROKE}>
+<path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v5h-5"/>
+</g></svg>''',
+    "workspace": f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+<g {_STROKE}>
+<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M9 4.5v15"/><path d="M9 10h11.5"/>
+</g></svg>''',
+    "settings": f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+<g {_STROKE}>
+<path d="M4 6h16"/><circle cx="9" cy="6" r="2"/><path d="M4 12h16"/><circle cx="15" cy="12" r="2"/><path d="M4 18h16"/><circle cx="11" cy="18" r="2"/>
+</g></svg>''',
 }
 
 ICON_NAMES = tuple(SVG_ICONS)

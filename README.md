@@ -1,5 +1,9 @@
 # Gipler
 
+<p align="center">
+  <img src="gipler/assets/gipler_trans.png" alt="Gipler" width="144">
+</p>
+
 Gipler is a standalone desktop application for inspecting project workspaces,
 configuring recognition sources, reviewing differences, and preparing
 explicitly authorized copy operations.
@@ -97,21 +101,35 @@ The removed Legacy flow used `~/.config/Gipler/ignore.toml`,
 reads them. They are kept untouched for reference; profile analysis only uses
 the profile configuration under `~/.config/Gipler/profiles/`.
 
-## Desktop integration
+## Visual identity and desktop integration
 
-The official icon ships inside the package (`gipler/assets`) and is applied to
-the application window, so it appears in the taskbar and in Alt+Tab.
+The approved visual identity lives in `gipler/assets`:
 
-Install the FreeDesktop launcher and the icon sizes under the user's XDG
-directories:
+- `gipler_solid.png` is the Solid master and the single source for the
+  application icon, windows, dialogs, taskbar, launcher, and About dialog.
+- `gipler_trans.png` is the transparent master reserved for documentation and
+  editorial material; the README logo is the only editorial use.
+
+All top-level windows resolve their icon through `gipler.resources` and
+`gipler.gui.identity`. To replace the design, overwrite the Solid master and
+run the permanent updater from any directory:
 
 ```sh
-python -m gipler.cli desktop
-python -m gipler.cli desktop --uninstall
+./scripts/update-icons.sh
 ```
 
-Regenerate the packaged sizes from the master `gipler.png` with
-`python tools/gen_icons.py`.
+The script regenerates every hicolor size and the `.ico` from the master,
+installs the FreeDesktop launcher under the user's XDG directories, updates
+existing Gipler desktop copies, and refreshes the icon and launcher caches. It
+is idempotent and never uses `sudo`.
+
+Optional commands:
+
+```sh
+./scripts/update-icons.sh --restart-panel   # refresh a running XFCE panel
+./scripts/update-icons.sh --skip-desktop    # regenerate project assets only
+python -m gipler.cli desktop --uninstall    # remove the launcher and icons
+```
 
 ## Safety
 

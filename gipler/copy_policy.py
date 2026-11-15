@@ -40,6 +40,8 @@ _MESSAGES = {
     "destino_no_configurado": "Destino no configurado o inexistente",
     "sin_cambios": "Sin cambios: no hay nada que copiar",
     "missing_in_dev": "El archivo no existe en el árbol de trabajo",
+    "missing_in_reference": "El archivo no existe en la referencia",
+    "origen_no_existe_en_analisis": "El origen no existía en el análisis",
     "sin_destino_o_propiedad": "Sin destino o propietario conocido",
     "ruta_fuera_del_repo": "La ruta quedaría fuera del destino",
     "destino_con_modificacion_local": "El destino tiene cambios locales",
@@ -227,6 +229,24 @@ def entry_copy_status(entry) -> str:
     if blockers and blockers != ("sin_cambios",):
         return STATUS_BLOCKED
     return STATUS_NO_APPLICABLE
+
+
+def reverse_row_blockers(row) -> tuple[str, ...]:
+    blockers: list[str] = []
+    if row.axis_a == "identical":
+        return ("sin_cambios",)
+    if row.axis_a == "new_in_dev":
+        return ("missing_in_reference",)
+    if row.axis_a not in ("modified_in_dev", "missing_in_dev"):
+        blockers.append(f"comparacion_no_copiable:{row.axis_a}")
+    if not row.owner or row.owner == "sin determinar":
+        blockers.append("sin_destino_o_propiedad")
+    bad = BLOCKING_INCIDENCES & set(row.incidences)
+    if bad:
+        blockers.append("incidencias_bloqueantes:" + ",".join(sorted(bad)))
+    if "present_in_both_repos" in row.incidences or "duplicate_tracked_in_both" in row.incidences:
+        blockers.append("presente_en_ambos_repos: resolucion_manual")
+    return tuple(dict.fromkeys(blockers))
 
 
 def static_row_blockers(row) -> tuple[str, ...]:

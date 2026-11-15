@@ -6,8 +6,8 @@ evitar QSS duplicado en cada pestaña.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLabel
+from PySide6.QtCore import QEvent, QSize, Qt
+from PySide6.QtWidgets import QLabel, QToolButton
 
 from gipler.gui.theme import PALETTES, load_preference
 
@@ -25,6 +25,64 @@ def palette(theme: str | None = None) -> dict[str, str]:
     return PALETTES.get(current, PALETTES["oscuro"])
 
 
+class ContextIconButton(QToolButton):
+    """Botón de icono compartido por las toolbars contextuales."""
+
+    def __init__(
+        self,
+        icon_name: str,
+        tooltip: str,
+        parent=None,
+        *,
+        icon_size: int = 18,
+        button_size: int = 28,
+        icon_palette_key: str | None = None,
+    ):
+        super().__init__(parent)
+        self._icon_name = icon_name
+        self._icon_palette_key = icon_palette_key
+        self.setObjectName("contextIconButton")
+        self.setIconSize(QSize(icon_size, icon_size))
+        self.setFixedSize(button_size, button_size)
+        self.setAutoRaise(True)
+        self.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.setToolTip(tooltip)
+        self.setAccessibleName(tooltip)
+        self._refresh_icon()
+
+    def _refresh_icon(self) -> None:
+        from gipler.gui import icons
+
+        color = None
+        if self._icon_palette_key:
+            color = palette().get(self._icon_palette_key)
+        self.setIcon(icons.icon(self._icon_name, color))
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.PaletteChange:
+            self._refresh_icon()
+
+
+def make_context_icon_button(
+    icon_name: str,
+    tooltip: str,
+    parent=None,
+    *,
+    icon_size: int = 18,
+    button_size: int = 28,
+    icon_palette_key: str | None = None,
+) -> ContextIconButton:
+    return ContextIconButton(
+        icon_name,
+        tooltip,
+        parent,
+        icon_size=icon_size,
+        button_size=button_size,
+        icon_palette_key=icon_palette_key,
+    )
+
+
 def make_context_label(text: str = "") -> QLabel:
     """Información contextual compartida por Sincronización y Git.
 
@@ -32,7 +90,7 @@ def make_context_label(text: str = "") -> QLabel:
     tipografía, alineación, padding y posición relativa a sus controles.
     """
     label = QLabel(text)
-    label.setObjectName("contextLabel")
+    label.setObjectName("contextInfoLabel")
     label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
     label.setMinimumWidth(155)
     font = label.font()
@@ -49,7 +107,11 @@ QWidget#panelSurface {{ background: {p['panel']}; border: 1px solid {p['borde']}
 QLabel {{ color: {p['texto']}; }}
 QLabel#sectionTitle {{ color: {p['texto']}; font-size: 13px; font-weight: 700; }}
 QLabel#contextLabel {{ color: {p['texto2']}; font-size: 11px; padding: 4px 8px; }}
+QLabel#contextInfoLabel {{ color: {p['texto2']}; font-size: 12px; font-weight: 500; padding: 4px 8px; }}
 QLabel#emptyState {{ color: {p['texto2']}; font-size: 12px; background: transparent; }}
+QLabel#aboutVersion {{ color: {p['texto2']}; font-size: 12px; }}
+QLabel#aboutDescription {{ color: {p['texto']}; font-size: 12px; }}
+QLabel#aboutLicense {{ color: {p['texto2']}; font-size: 11px; }}
 QComboBox {{
     background: {p['tabla']}; color: {p['texto']}; border: 1px solid {p['borde']};
     border-radius: {RADIUS_CONTROL}px; padding: 6px 8px; min-height: {CONTROL_HEIGHT - 12}px;
@@ -77,6 +139,20 @@ QToolButton {{
     border-radius: {RADIUS_CONTROL}px; padding: 4px 8px;
 }}
 QToolButton:hover {{ border-color: {p['acento']}; }}
+QToolButton#contextIconButton {{
+    background: transparent; border: none; padding: 0px; border-radius: 4px;
+}}
+QToolButton#contextIconButton:hover {{ background: rgba(127, 127, 127, 0.12); }}
+QToolButton#contextIconButton:pressed,
+QToolButton#contextIconButton:checked {{ background: rgba(127, 127, 127, 0.18); }}
+QToolButton#contextIconButton:disabled {{ background: transparent; }}
+QToolButton#globalIconButton {{
+    background: transparent; border: none; padding: 0px; border-radius: 4px;
+}}
+QToolButton#globalIconButton:hover {{ background: rgba(127, 127, 127, 0.18); }}
+QToolButton#globalIconButton:pressed,
+QToolButton#globalIconButton:checked {{ background: rgba(127, 127, 127, 0.24); }}
+QToolButton#globalIconButton:disabled {{ background: transparent; }}
 QPushButton#assignPlusButton {{
     background: transparent; border: none; color: {p['texto2']}; font-size: 14px;
     font-weight: 600; padding: 0px; min-width: 22px; min-height: 22px;
@@ -99,6 +175,8 @@ QLabel#directoryHeaderTitle {{
     background: transparent; border: none; color: {p['texto']};
 }}
 QTreeView {{ background: transparent; border: none; outline: none; }}
+QTreeView#semanticTree::item {{ padding: 3px 4px; }}
+QTreeView#referenceTree {{ padding-left: 6px; }}
 QTreeView::item {{ background: transparent; }}
 QTreeView::item:selected {{ background: {p['seleccion']}; }}
 QTreeView::item:hover {{ background: {p['panel2']}; }}

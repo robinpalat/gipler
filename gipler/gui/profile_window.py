@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 import os
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -19,11 +19,12 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QMenu,
     QPushButton,
     QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -43,6 +44,13 @@ from gipler.profile import (
 from gipler.profile_analysis import ProfileEntry, analyze_profile
 from gipler.selection import selection_key_for_entry
 from gipler.recognition import MembershipState
+from gipler.gui import icons
+from gipler.gui.identity import apply_window_icon
+from gipler.gui.profile_hierarchy import (
+    HierarchyNode,
+    build_excluded_tree,
+    build_indeterminate_sections,
+)
 
 
 class EstablishBaselineDialog(QDialog):
@@ -78,6 +86,7 @@ class EstablishBaselineDialog(QDialog):
             self.other_references,
         )
         self.setWindowTitle("Establecer línea de base")
+        apply_window_icon(self)
         self.setMinimumSize(620, 520)
 
         layout = QVBoxLayout(self)
@@ -272,8 +281,6 @@ class ProfileListPage(QWidget):
     # (entrada, id de referencia) — pertenencia explícita, sin copia.
     assign_requested = Signal(object, str)
 
-    UNASSIGNED_LABEL = "[Nuevo sin asignar]"
-
     def __init__(
         self,
         entries: tuple | list,
@@ -284,12 +291,24 @@ class ProfileListPage(QWidget):
         parent=None,
         unassigned: tuple | list = (),
         targets: tuple | list = (),
+        included: tuple | list = (),
+        all_entries: tuple | list = (),
     ):
         super().__init__(parent)
         self.mode = mode
         self._syncing_checks = False
         self._targets = [(str(source_id), str(name)) for source_id, name in targets]
         self._unassigned = tuple(unassigned or ())
+        self._eligible_keys = eligible_keys
+        if mode == "excluded":
+            hierarchy = build_excluded_tree(entries, included)
+        elif mode == "indeterminate":
+            hierarchy = build_indeterminate_sections(
+                entries, self._unassigned, all_entries
+            )
+        else:
+            hierarchy = self._flat_nodes(entries)
+        self._hierarchy = hierarchy
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
@@ -297,17 +316,18 @@ class ProfileListPage(QWidget):
         self.search = QLineEdit()
         self.search.setPlaceholderText("Buscar por ruta…")
         self.search.setObjectName("searchField")
-        self.list = QListWidget()
-        self.list.setObjectName("semanticList")
+        self.list = QTreeWidget()
+        self.list.setObjectName("semanticTree")
+        self.list.setColumnCount(1)
+        self.list.setHeaderHidden(True)
+        self.list.setRootIsDecorated(True)
+        self.list.setIndentation(16)
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._open_context_menu)
-        self.list.itemSelectionChanged.connect(self._selection_changed)
-        self.list.itemDoubleClicked.connect(self._activate)
         self.empty_label = QLabel(empty_text)
         self.empty_label.setAlignment(Qt.AlignCenter)
         self.empty_label.setObjectName("emptyState")
-        show_unassigned = mode == "indeterminate" and bool(self._unassigned)
-        has_items = bool(entries) or show_unassigned
+        has_items = bool(hierarchy)
         self.empty_label.setVisible(not has_items)
         self.list.setVisible(has_items)
         layout.addWidget(self.search)
@@ -328,31 +348,10 @@ class ProfileListPage(QWidget):
         actions.addWidget(self.rule_button)
         self.action_row.setVisible(mode in ("excluded", "indeterminate"))
         layout.addWidget(self.action_row)
+        self._populate_tree(hierarchy)
         self.search.textChanged.connect(self._filter)
-        if show_unassigned:
-            self._add_section_header("Archivos nuevos")
-            for entry in self._unassigned:
-                self._add_unassigned_item(entry)
-            if entries:
-                self._add_section_header("Otros indeterminados")
-        for entry in entries:
-            item = QListWidgetItem(self._label(entry))
-            item.setData(Qt.UserRole, entry)
-            tooltip = getattr(entry, "path", "")
-            blockers = getattr(entry, "copy_blockers", ())
-            if blockers:
-                from gipler.copy_policy import describe_blockers
-
-                tooltip += "\nCopia: " + "; ".join(describe_blockers(blockers))
-            item.setToolTip(tooltip)
-            key = self._copy_key(entry, eligible_keys)
-            if key is not None:
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Unchecked)
-                item.setData(Qt.UserRole + 1, key)
-            else:
-                item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
-            self.list.addItem(item)
+        self.list.itemSelectionChanged.connect(self._selection_changed)
+        self.list.itemDoubleClicked.connect(self._activate)
         self.list.itemChanged.connect(self._copy_check_changed)
         if disabled:
             self.search.setEnabled(False)
@@ -361,24 +360,53 @@ class ProfileListPage(QWidget):
             self.empty_label.setVisible(True)
             self.action_row.setVisible(False)
 
-    def _add_section_header(self, title: str) -> None:
-        item = QListWidgetItem(title)
-        item.setFlags(Qt.NoItemFlags)
-        font = item.font()
-        font.setBold(True)
-        item.setFont(font)
-        self.list.addItem(item)
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.PaletteChange and hasattr(self, "list"):
+            self._refresh_item_visuals()
 
-    def _add_unassigned_item(self, entry) -> None:
+    def _refresh_item_visuals(self) -> None:
         from gipler.gui.theme import load_preference, semantic
 
-        item = QListWidgetItem(f"{entry.path}  {self.UNASSIGNED_LABEL}")
-        item.setData(Qt.UserRole, entry)
-        item.setData(Qt.UserRole + 2, True)
-        item.setToolTip("Archivo nuevo aparecido tras la línea de base; sin referencia asignada")
-        item.setForeground(QColor(semantic(load_preference(), "new_in_dev")))
-        item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
-        self.list.addItem(item)
+        color = QColor(semantic(load_preference(), "new_in_dev"))
+
+        def visit(item: QTreeWidgetItem) -> None:
+            node = item.data(0, Qt.UserRole + 3)
+            if node is not None and node.icon:
+                item.setIcon(0, icons.icon(node.icon))
+            if node is not None and node.is_unassigned:
+                item.setForeground(0, color)
+            for index in range(item.childCount()):
+                visit(item.child(index))
+
+        for index in range(self.list.topLevelItemCount()):
+            visit(self.list.topLevelItem(index))
+
+    def _flat_nodes(self, entries) -> list[HierarchyNode]:
+        nodes: list[HierarchyNode] = []
+        for entry in entries:
+            kind = getattr(entry, "kind", getattr(getattr(entry, "physical", entry), "kind", "file"))
+            nodes.append(
+                HierarchyNode(
+                    path=getattr(entry, "path", ""),
+                    label=self._label(entry),
+                    icon="folder" if kind == "directory" else "file",
+                    entry=entry,
+                    tooltip=self._tooltip(entry),
+                    is_dir=kind == "directory",
+                )
+            )
+        return nodes
+
+    @staticmethod
+    def _tooltip(entry) -> str:
+        tooltip = getattr(entry, "path", "")
+        blockers = getattr(entry, "copy_blockers", ())
+        if blockers:
+            from gipler.copy_policy import describe_blockers
+
+            tooltip += "\nCopia: " + "; ".join(describe_blockers(blockers))
+        return tooltip
 
     @staticmethod
     def _label(entry) -> str:
@@ -403,8 +431,53 @@ class ProfileListPage(QWidget):
             return f"{path}  (exclusión {nature}: {rule})"
         return path
 
-    @staticmethod
-    def _copy_key(entry, eligible_keys: set[tuple[str, str]] | None = None):
+    def _populate_tree(self, nodes: list[HierarchyNode]) -> None:
+        self.list.clear()
+        for node in nodes:
+            self.list.addTopLevelItem(self._make_item(node))
+        for index in range(self.list.topLevelItemCount()):
+            self._apply_expansion(self.list.topLevelItem(index))
+
+    def _apply_expansion(self, item: QTreeWidgetItem) -> None:
+        node = item.data(0, Qt.UserRole + 3)
+        if node is not None:
+            item.setExpanded(node.default_expanded)
+        for index in range(item.childCount()):
+            self._apply_expansion(item.child(index))
+
+    def _make_item(self, node: HierarchyNode) -> QTreeWidgetItem:
+        item = QTreeWidgetItem([node.label])
+        item.setData(0, Qt.UserRole, node.entry)
+        item.setData(0, Qt.UserRole + 2, node.is_unassigned)
+        item.setData(0, Qt.UserRole + 3, node)
+        item.setToolTip(0, node.tooltip)
+        if node.icon:
+            item.setIcon(0, icons.icon(node.icon))
+        key = self._copy_key(node.entry, self._eligible_keys)
+        if key is not None:
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(0, Qt.Unchecked)
+            item.setData(0, Qt.UserRole + 1, key)
+        else:
+            item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
+        if node.is_section:
+            item.setFlags(Qt.NoItemFlags)
+            font = item.font(0)
+            font.setBold(True)
+            item.setFont(0, font)
+        elif node.entry is None:
+            item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
+        if node.is_unassigned:
+            from gipler.gui.theme import load_preference, semantic
+
+            item.setForeground(0, QColor(semantic(load_preference(), "new_in_dev")))
+        for child in node.children:
+            item.addChild(self._make_item(child))
+        return item
+
+    def _copy_key(self, entry, eligible_keys: set[tuple[str, str]] | None = None):
+        if entry is None:
+            return None
         key = selection_key_for_entry(entry)
         if key is None:
             return None
@@ -412,53 +485,85 @@ class ProfileListPage(QWidget):
             return None
         return key
 
-    def _copy_check_changed(self, item: QListWidgetItem) -> None:
+    def _copy_check_changed(self, item: QTreeWidgetItem, _column: int = 0) -> None:
         if self._syncing_checks:
             return
-        key = item.data(Qt.UserRole + 1)
+        key = item.data(0, Qt.UserRole + 1)
         if key is not None:
-            self.copy_selection_changed.emit(key, item.checkState() == Qt.Checked)
+            self.copy_selection_changed.emit(key, item.checkState(0) == Qt.Checked)
 
     def sync_selection(self, selected: set[tuple[str, str]]) -> None:
         self._syncing_checks = True
-        for index in range(self.list.count()):
-            item = self.list.item(index)
-            key = item.data(Qt.UserRole + 1)
+
+        def visit(item: QTreeWidgetItem) -> None:
+            key = item.data(0, Qt.UserRole + 1)
             if key is not None:
-                item.setCheckState(Qt.Checked if key in selected else Qt.Unchecked)
+                item.setCheckState(
+                    0, Qt.Checked if key in selected else Qt.Unchecked
+                )
+            for index in range(item.childCount()):
+                visit(item.child(index))
+
+        for index in range(self.list.topLevelItemCount()):
+            visit(self.list.topLevelItem(index))
         self._syncing_checks = False
 
     def _filter(self, text: str) -> None:
         needle = text.casefold()
         visible = 0
-        for index in range(self.list.count()):
-            item = self.list.item(index)
-            shown = needle in getattr(item.data(Qt.UserRole), "path", "").casefold()
-            item.setHidden(not shown)
-            visible += int(shown)
-        if self.list.count():
+        for index in range(self.list.topLevelItemCount()):
+            if self._filter_item(self.list.topLevelItem(index), needle):
+                visible += 1
+        if self.list.topLevelItemCount():
             self.empty_label.setText("Sin resultados")
             self.empty_label.setVisible(visible == 0)
+        if self.list.topLevelItemCount() and visible:
+            self.list.setVisible(True)
+
+    def _filter_item(self, item: QTreeWidgetItem, needle: str) -> bool:
+        node = item.data(0, Qt.UserRole + 3)
+        own_match = bool(needle) and (
+            needle in getattr(node, "path", "").casefold()
+            or needle in getattr(node, "label", "").casefold()
+        )
+        child_visible = False
+        for index in range(item.childCount()):
+            if self._filter_item(item.child(index), needle):
+                child_visible = True
+        shown = not needle or own_match or child_visible
+        item.setHidden(not shown)
+        if needle and shown and child_visible:
+            item.setExpanded(True)
+        return shown
+
+    def current_node(self) -> HierarchyNode | None:
+        item = self.list.currentItem()
+        return item.data(0, Qt.UserRole + 3) if item else None
 
     def current_entry(self):
-        item = self.list.currentItem()
-        return item.data(Qt.UserRole) if item else None
+        node = self.current_node()
+        return node.entry if node is not None else None
 
     def _selection_changed(self) -> None:
-        entry = self.current_entry()
+        node = self.current_node()
+        entry = node.entry if node is not None else None
         self.selected.emit(entry)
         if self.mode == "excluded":
-            self.restore_button.setEnabled(entry is not None)
+            self.restore_button.setEnabled(
+                bool(node is not None and node.restorable)
+            )
         elif self.mode == "indeterminate":
             self.rule_button.setEnabled(self._can_create_rule(entry))
 
-    def _activate(self, item: QListWidgetItem) -> None:
-        self.activated.emit(item.data(Qt.UserRole))
+    def _activate(self, item: QTreeWidgetItem, _column: int = 0) -> None:
+        entry = item.data(0, Qt.UserRole)
+        if entry is not None:
+            self.activated.emit(entry)
 
     def _restore(self) -> None:
-        entry = self.current_entry()
-        if entry is not None:
-            self.restore_requested.emit(entry)
+        node = self.current_node()
+        if node is not None and node.restorable:
+            self.restore_requested.emit(node.entry)
 
     def _create_rule(self) -> None:
         entry = self.current_entry()
@@ -484,8 +589,8 @@ class ProfileListPage(QWidget):
         self.list.setCurrentItem(item)
         menu.exec(self.list.viewport().mapToGlobal(position))
 
-    def context_menu_for(self, item: QListWidgetItem | None) -> QMenu | None:
-        entry = item.data(Qt.UserRole) if item is not None else None
+    def context_menu_for(self, item: QTreeWidgetItem | None) -> QMenu | None:
+        entry = item.data(0, Qt.UserRole) if item is not None else None
         if entry is None:
             return None
         menu = QMenu(self)
@@ -514,13 +619,13 @@ class ProfileListPage(QWidget):
         return menu
 
     @staticmethod
-    def _is_unassigned(item: QListWidgetItem | None, entry) -> bool:
-        if item is not None and item.data(Qt.UserRole + 2):
+    def _is_unassigned(item: QTreeWidgetItem | None, entry) -> bool:
+        if item is not None and item.data(0, Qt.UserRole + 2):
             return True
         return bool(getattr(entry, "is_unassigned_new", False))
 
     @classmethod
-    def _can_assign(cls, item: QListWidgetItem | None, entry) -> bool:
+    def _can_assign(cls, item: QTreeWidgetItem | None, entry) -> bool:
         """Permite asignar archivos nuevos sin referencia y pertenencias
         compartidas. La asignación explícita resuelve la membresía múltiple
         sin cambiar el comportamiento de UNKNOWN ni AMBIGUOUS."""
@@ -538,15 +643,18 @@ class ProfileLauncherDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Abrir perfil de Gipler")
+        self.setWindowTitle("Abrir espacio de trabajo de Gipler")
+        apply_window_icon(self)
         self.setMinimumWidth(440)
         self.profile_id: str | None = None
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Seleccione un perfil o cree uno nuevo."))
+        layout.addWidget(
+            QLabel("Seleccione un espacio de trabajo o cree uno nuevo.")
+        )
         self.profiles = QComboBox()
         layout.addWidget(self.profiles)
         row = QHBoxLayout()
-        self.create_button = QPushButton("Crear perfil…")
+        self.create_button = QPushButton("Crear espacio de trabajo…")
         self.open_button = QPushButton("Abrir")
         self.delete_button = QPushButton("Eliminar…")
         row.addWidget(self.create_button)
@@ -582,7 +690,9 @@ class ProfileLauncherDialog(QDialog):
         self.delete_button.setEnabled(has_profile)
 
     def _create(self) -> None:
-        name, accepted = QInputDialog.getText(self, "Nuevo perfil", "Nombre del perfil:")
+        name, accepted = QInputDialog.getText(
+            self, "Nuevo espacio de trabajo", "Nombre del espacio de trabajo:"
+        )
         if not accepted:
             return
         work_dir = QFileDialog.getExistingDirectory(self, "Directorio de trabajo")
@@ -592,7 +702,9 @@ class ProfileLauncherDialog(QDialog):
             profile = create_profile(name, work_dir)
             set_last_profile_id(profile.id)
         except (ProfileError, OSError) as exc:
-            QMessageBox.critical(self, "No se pudo crear el perfil", str(exc))
+            QMessageBox.critical(
+                self, "No se pudo crear el espacio de trabajo", str(exc)
+            )
             return
         self.profile_id = profile.id
         self.accept()
@@ -609,8 +721,8 @@ class ProfileLauncherDialog(QDialog):
             return
         answer = QMessageBox.question(
             self,
-            "Eliminar perfil",
-            "¿Eliminar el perfil y su configuración? No se borrarán los archivos "
+            "Eliminar espacio de trabajo",
+            "¿Eliminar el espacio de trabajo y su configuración? No se borrarán los archivos "
             "del directorio de trabajo ni de las fuentes.",
         )
         if answer != QMessageBox.Yes:
@@ -618,7 +730,9 @@ class ProfileLauncherDialog(QDialog):
         try:
             delete_profile(profile_id)
         except (ProfileError, OSError) as exc:
-            QMessageBox.critical(self, "No se pudo eliminar el perfil", str(exc))
+            QMessageBox.critical(
+                self, "No se pudo eliminar el espacio de trabajo", str(exc)
+            )
             return
         self._refresh_profiles()
 
@@ -636,6 +750,7 @@ class SourceDialog(QDialog):
             if source is not None
             else "Agregar directorio de sincronización"
         )
+        apply_window_icon(self)
         self.source = source
         self._initial_alternative = bool(
             source
