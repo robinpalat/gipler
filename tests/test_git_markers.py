@@ -9,10 +9,10 @@ import os
 import tempfile
 import unittest
 
-from .helpers import commit_all, git, make_repo, write
+from .helpers import commit_all, git, make_profile, make_repo, write
 
 from gipler.comparator import compare_pair
-from gipler.report import Row, markers, render, state_detail, tooltip_text
+from gipler.report import Row, markers, state_detail, tooltip_text
 from gipler.scanner import Entry, git_change_details, scan_tree
 
 
@@ -58,15 +58,15 @@ class MarkerSemanticsTests(unittest.TestCase):
         self.assertIn("Marcador: *⌀", text)
         self.assertIn("Detalle: contenido · unstaged · ⌀ 755→644", text)
 
-    def test_report_sections_4b_and_4c(self):
+    def test_profile_report_sections(self):
+        from gipler.report import render_profile
         rows = [
             _row("nc.sh", a="not_comparable"),
             _row("p.sh", perm="755→644"),
         ]
-        out = render({"dev": "d", "principal": "p", "addons": "a"}, rows, [])
-        self.assertIn("## 4b. No comparables (not_comparable) (1)", out)
-        self.assertIn("## 4c. Diferencia de permisos Dev→repo (⌀) (1)", out)
-        self.assertIn("[*]", render({}, [_row(b="tracked_modified", a="identical")], []))
+        out = render_profile("Perfil", "/work", {"src_0": "Ref"}, {"src_0": tuple(rows)})
+        self.assertIn("not_comparable=1", out)
+        self.assertIn("Ref [src_0]", out)
 
 
 class NotComparableTests(unittest.TestCase):
@@ -89,22 +89,24 @@ class NotComparableTests(unittest.TestCase):
         )
 
     def test_end_to_end_unreadable_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            dev = os.path.join(tmp, "dev")
-            principal = make_repo(tmp, "principal")
-            addons = make_repo(tmp, "addons")
-            os.makedirs(dev, exist_ok=True)
-            write(os.path.join(dev, "main.sh"), "same\n", executable=True)
-            write(os.path.join(principal, "main.sh"), "same\n", executable=True)
-            commit_all(principal)
-            os.chmod(os.path.join(dev, "main.sh"), 0o000)
-            from gipler.analysis import analyze
+        from gipler.profile_analysis import analyze_profile
 
-            _, rows, info = analyze(dev, principal, addons)
+        with tempfile.TemporaryDirectory() as tmp:
+            profile, work, _roots = make_profile(
+                tmp,
+                work_files={"main.sh": "same\n"},
+                sources=[{"name": "Ref", "files": {"main.sh": "same\n"}}],
+            )
+            os.chmod(os.path.join(work, "main.sh"), 0o000)
+            analysis = analyze_profile(profile)
+            rows = [
+                row
+                for source_rows in analysis.rows_by_source.values()
+                for row in source_rows
+            ]
             target = [r for r in rows if r.path == "main.sh"]
             self.assertTrue(target, "la fila debe existir")
             self.assertEqual(target[0].axis_a, "not_comparable")
-            self.assertEqual(info["counts"]["not_comparable"], 1)
 
 
 class GitChangeDetailsTests(unittest.TestCase):
@@ -155,49 +157,51 @@ class GitChangeDetailsTests(unittest.TestCase):
 
 class AnalysisPermisosTests(unittest.TestCase):
     def test_perm_diff_does_not_touch_axis_a(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            dev = os.path.join(tmp, "dev")
-            principal = make_repo(tmp, "principal")
-            addons = make_repo(tmp, "addons")
-            os.makedirs(dev, exist_ok=True)
-            write(os.path.join(dev, "main.sh"), "same\n", executable=True)
-            repo_file = os.path.join(principal, "main.sh")
-            write(repo_file, "same\n")
-            os.chmod(repo_file, 0o644)
-            commit_all(principal)
-            from gipler.analysis import analyze
+        from gipler.profile_analysis import analyze_profile
 
-            _, rows, info = analyze(dev, principal, addons)
+        with tempfile.TemporaryDirectory() as tmp:
+            profile, work, roots = make_profile(
+                tmp,
+                work_files={"main.sh": "same\n"},
+                sources=[{"name": "Ref", "files": {"main.sh": "same\n"}}],
+            )
+            os.chmod(os.path.join(work, "main.sh"), 0o755)
+            os.chmod(os.path.join(roots["src_000000"], "main.sh"), 0o644)
+            analysis = analyze_profile(profile)
+            rows = [
+                row
+                for source_rows in analysis.rows_by_source.values()
+                for row in source_rows
+            ]
             target = next(r for r in rows if r.path == "main.sh")
             self.assertEqual(target.axis_a, "identical")
             self.assertEqual(target.axis_b, "tracked_clean")
             self.assertEqual(target.perm, "755→644 · bit ejecutable")
             self.assertTrue(target.perm_marker)
-            self.assertEqual(info["counts"]["perm_diff"], 1)
-            self.assertEqual(info["counts"]["git_change_content"], 0)
 
     def test_asterisk_end_to_end_with_pending_content(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            dev = os.path.join(tmp, "dev")
-            principal = make_repo(tmp, "principal")
-            addons = make_repo(tmp, "addons")
-            os.makedirs(dev, exist_ok=True)
-            write(os.path.join(principal, "main.sh"), "v1\n")
-            commit_all(principal)
-            # Repo con cambio sin staged; Dev ya refleja el nuevo contenido.
-            write(os.path.join(principal, "main.sh"), "v2\n")
-            write(os.path.join(dev, "main.sh"), "v2\n")
-            from gipler.analysis import analyze
+        from gipler.profile_analysis import analyze_profile
 
-            _, rows, info = analyze(dev, principal, addons)
+        with tempfile.TemporaryDirectory() as tmp:
+            profile, work, roots = make_profile(
+                tmp,
+                work_files={"main.sh": "v2\n"},
+                sources=[{"name": "Ref", "files": {"main.sh": "v1\n"}}],
+            )
+            # Repo con cambio sin staged; Dev ya refleja el nuevo contenido.
+            write(os.path.join(roots["src_000000"], "main.sh"), "v2\n")
+            analysis = analyze_profile(profile)
+            rows = [
+                row
+                for source_rows in analysis.rows_by_source.values()
+                for row in source_rows
+            ]
             target = next(r for r in rows if r.path == "main.sh")
             self.assertEqual(target.axis_a, "identical")
             self.assertEqual(target.axis_b, "tracked_modified")
             self.assertTrue(target.asterisk)
             self.assertEqual(target.git_change, "contenido")
             self.assertEqual(target.git_stage, "unstaged")
-            self.assertEqual(info["counts"]["git_change_content"], 1)
-            self.assertEqual(info["counts"]["git_staged"], 0)
 
 
 # ---------------------------------------------------------------- GUI
@@ -210,10 +214,18 @@ class GuiMarkerTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def _window(self, rows):
-        from gipler.gui.main_window import GiplerWindow
+        from .helpers import make_profile_window
 
-        w = GiplerWindow(rows=rows)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        w, patcher = make_profile_window(tmp.name, rows)
+        self.addCleanup(patcher.stop)
         self.addCleanup(w.close)
+        for proxy in (w.proxy, w.repo_proxy):
+            proxy.set_criteria(
+                axis_a=None, axis_b=None, incidences=False, search="",
+                owner="", exclude_identical=False,
+            )
         return w
 
     def _index(self, w, path, proxy=None):
@@ -330,39 +342,26 @@ class GuiMarkerTests(unittest.TestCase):
 
 # ---------------------------------------------------------------- TUI
 class TuiMarkerTests(unittest.TestCase):
-    def _state(self, rows):
-        from gipler.tui import State
+    def test_profile_tui_views_and_states(self):
+        from gipler.profile_analysis import analyze_profile
+        from gipler.tui import ProfileState
 
-        return State(rows, {"dev": "", "principal": "", "addons": ""}, [])
-
-    def test_filters_include_not_comparable_and_permisos(self):
-        from gipler.tui import FILTERS
-
-        keys = [k for k, _ in FILTERS]
-        self.assertIn("not_comparable", keys)
-        self.assertIn("permisos", keys)
-
-        rows = [
-            _row("nc.sh", a="not_comparable"),
-            _row("p.sh", a="identical", perm="755→644"),
-            _row("ok.sh", a="modified_in_dev"),
-        ]
-        st = self._state(rows)
-        st.filter_key = "not_comparable"
-        self.assertEqual([r.path for r in st.visible()], ["nc.sh"])
-        st.filter_key = "permisos"
-        self.assertEqual([r.path for r in st.visible()], ["p.sh"])
-
-    def test_detail_and_render_list_show_markers(self):
-        rows = [_row("star.sh", a="identical", b="tracked_modified",
-                     git_change="contenido", git_stage="unstaged", perm="755→644")]
-        st = self._state(rows)
-        detail = st.detail(rows[0], {"dev": "", "principal": "", "addons": ""})
-        self.assertIn("Marcador: *⌀", detail)
-        self.assertIn("Detalle: contenido · unstaged · ⌀ 755→644", detail)
-        listing = st.render_list()
-        self.assertIn("star.sh *⌀", listing)
-        self.assertIn("· contenido · unstaged · ⌀ 755→644", listing)
+        with tempfile.TemporaryDirectory() as tmp:
+            profile, _work, roots = make_profile(
+                tmp,
+                work_files={"star.sh": "v2\n"},
+                sources=[{"name": "Ref", "files": {"star.sh": "v1\n"}}],
+            )
+            write(os.path.join(roots["src_000000"], "star.sh"), "v2\n")
+            analysis = analyze_profile(profile)
+            state = ProfileState(profile, analysis)
+            self.assertIn("source:src_000000", state.views)
+            state.active_view = "source:src_000000"
+            listing = state.render_list()
+            self.assertIn("star.sh", listing)
+            self.assertIn("A=identical B=tracked_modified", listing)
+            detail = state.render_detail()
+            self.assertIn("star.sh", detail)
 
 
 # ------------------------------------------------------- escritorio

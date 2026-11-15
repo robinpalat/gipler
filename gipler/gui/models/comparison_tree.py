@@ -12,7 +12,8 @@ from __future__ import annotations
 from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt, Signal
 from PySide6.QtGui import QColor
 
-from gipler.report import markers, state_detail, tooltip_text
+from gipler.report import markers, state_detail, tooltip_text, warnings_text
+from gipler.selection import selection_key_for
 
 
 class Node:
@@ -70,12 +71,16 @@ def color_for_row(row, theme: str = "oscuro") -> str:
 
 class ComparisonTreeModel(QAbstractItemModel):
     copy_selection_changed = Signal(object, bool)
+    commit_selection_changed = Signal(object)
 
     def __init__(self, rows: list | None = None, destination: str | None = None, parent=None):
         super().__init__(parent)
         self.destination = destination
         self.checked_keys: set[tuple[str, str]] = set()
         self.eligible_keys: set[tuple[str, str]] | None = None
+        self.commit_mode = False
+        self.commit_selected: set[str] = set()
+        self.commit_eligible: set[str] = set()
         self.semantic_theme = "oscuro"
         self._root = Node("", "")
         self._rows: list = []
@@ -93,10 +98,6 @@ class ComparisonTreeModel(QAbstractItemModel):
         )
         self._build()
         self.endResetModel()
-
-    @staticmethod
-    def _selection_key(row, path: str) -> tuple[str, str]:
-        return getattr(row, "selection_key", None) or (row.destination, path)
 
     def _build(self) -> None:
         self._root = Node("", "")
@@ -156,7 +157,17 @@ class ComparisonTreeModel(QAbstractItemModel):
             return node.path
         if role == Qt.CheckStateRole:
             if index.column() == 0 and node.row is not None:
-                key = self._selection_key(node.row, node.path)
+                if self.commit_mode:
+                    if node.path not in self.commit_eligible:
+                        return None
+                    return (
+                        Qt.Checked
+                        if node.path in self.commit_selected
+                        else Qt.Unchecked
+                    )
+                key = selection_key_for(node.row)
+                if key is None:
+                    return None
                 return Qt.Checked if key in self.checked_keys else Qt.Unchecked
             return None
         if role == Qt.ForegroundRole and index.column() == 0 and node.row is not None:
@@ -172,7 +183,7 @@ class ComparisonTreeModel(QAbstractItemModel):
                 detail = state_detail(node.row)
                 return f"{node.row.axis_b} · {detail}" if detail else node.row.axis_b
             if node.row is not None and index.column() == 2:
-                return ",".join(node.row.incidences)
+                return warnings_text(node.row)
         return None
 
     def headerData(self, section: int, orientation, role: int = Qt.DisplayRole):
@@ -186,7 +197,20 @@ class ComparisonTreeModel(QAbstractItemModel):
         node = self._node_for(index)
         if node.row is None:
             return False
-        key = self._selection_key(node.row, node.path)
+        if self.commit_mode:
+            if node.path not in self.commit_eligible:
+                return False
+            new_val = getattr(value, "value", value)
+            if new_val == 2:
+                self.commit_selected.add(node.path)
+            else:
+                self.commit_selected.discard(node.path)
+            self.dataChanged.emit(index, index, [Qt.CheckStateRole])
+            self.commit_selection_changed.emit(set(self.commit_selected))
+            return True
+        key = selection_key_for(node.row)
+        if key is None:
+            return False
         if self.eligible_keys is not None and key not in self.eligible_keys:
             return False
         # Qt pasa el valor como CheckState (enum) o int según la vía:
@@ -207,12 +231,44 @@ class ComparisonTreeModel(QAbstractItemModel):
         base |= Qt.ItemIsEnabled | Qt.ItemIsSelectable
         if index.column() == 0 and index.isValid():
             node = self._node_for(index)
-            key = self._selection_key(node.row, node.path) if node.row is not None else None
-            if node.row is not None and (
-                self.eligible_keys is None or key in self.eligible_keys
-            ):
-                base |= Qt.ItemIsUserCheckable
+            if self.commit_mode:
+                if node.row is not None and node.path in self.commit_eligible:
+                    base |= Qt.ItemIsUserCheckable
+            else:
+                key = selection_key_for(node.row) if node.row is not None else None
+                if (
+                    node.row is not None
+                    and key is not None
+                    and (self.eligible_keys is None or key in self.eligible_keys)
+                ):
+                    base |= Qt.ItemIsUserCheckable
         return base
+
+    def set_commit_eligible(self, paths) -> None:
+        self.commit_eligible = set(paths)
+        self.clear_commit_selection()
+
+    def clear_commit_selection(self) -> None:
+        self.commit_selected = set()
+        self._emit_commit_data_changed()
+
+    def add_commit_paths(self, paths) -> None:
+        self.commit_selected.update(paths)
+        self._emit_commit_data_changed()
+
+    def remove_commit_paths(self, paths) -> None:
+        self.commit_selected.difference_update(paths)
+        self._emit_commit_data_changed()
+
+    def _emit_commit_data_changed(self) -> None:
+        def walk(parent: QModelIndex) -> None:
+            for row in range(self.rowCount(parent)):
+                index = self.index(row, 0, parent)
+                self.dataChanged.emit(index, index, [Qt.CheckStateRole])
+                walk(index)
+
+        walk(QModelIndex())
+        self.commit_selection_changed.emit(set(self.commit_selected))
 
     def node_at(self, index: QModelIndex) -> Node:
         return self._node_for(index)

@@ -113,21 +113,36 @@ class NewFileAssignmentGuiTests(unittest.TestCase):
         panel = window.inicio_panel
         self.assertFalse(panel.assign_box.isHidden())
         self.assertEqual(panel.pending_paths(), ["hola.txt"])
-        combo = panel._assign_combos["hola.txt"]
-        labels = [
-            combo.itemText(index) for index in range(1, combo.count())
-        ]
-        self.assertEqual(labels, ["Principal", "Herramientas"])
-        ids = [
-            combo.itemData(index) for index in range(1, combo.count())
-        ]
-        self.assertEqual(ids, ["src_ref_a", "src_ref_b"])
+        self.assertEqual(
+            panel._assignment_targets,
+            [("src_ref_a", "Principal"), ("src_ref_b", "Herramientas")],
+        )
         # No se incorpora al inventario general de Inicio.
         rows_in_list = [
             panel.list.item(index).data(Qt.UserRole)
             for index in range(panel.list.count())
         ]
         self.assertNotIn("hola.txt", {row.path for row in rows_in_list})
+
+    def test_pending_assignments_have_limited_height_and_internal_scroll(self):
+        for index in range(1, 13):
+            self._write(
+                self.work,
+                f"pendientes/archivo_{index:02d}.txt",
+                f"nuevo {index}",
+            )
+        window = self._window()
+        window.reanalyze()
+        panel = window.inicio_panel
+        window.show()
+        APP.processEvents()
+
+        self.assertEqual(panel.assign_box.maximumHeight(), 260)
+        self.assertEqual(panel.assign_rows_scroll.maximumHeight(), 180)
+        self.assertGreater(
+            panel.assign_rows_scroll.widget().height(), 180
+        )
+        self.assertIn("(13)", panel.assign_title.text())
 
     def test_home_pending_rows_have_no_redundant_notice_and_limited_combo_width(self):
         self._write(self.work, "segundo.txt", "nuevo2")
@@ -146,23 +161,17 @@ class NewFileAssignmentGuiTests(unittest.TestCase):
         )
         self.assertEqual(
             panel.assign_title.text(),
-            "Archivos nuevos pendientes de asignación",
+            "Archivos nuevos pendientes de asignación (2)",
         )
 
         from gipler.gui.theme import load_preference, semantic
 
         color = semantic(load_preference(), "new_in_dev")
-        widths = []
         for path in panel.pending_paths():
-            combo = panel._assign_combos[path]
-            self.assertEqual(
-                combo.sizePolicy().horizontalPolicy(), QSizePolicy.Fixed
-            )
-            self.assertGreaterEqual(combo.maximumWidth(), 260)
-            self.assertLessEqual(combo.maximumWidth(), 300)
-            self.assertGreaterEqual(combo.width(), 260)
-            self.assertLessEqual(combo.width(), 300)
-            widths.append(combo.width())
+            button = panel._assign_buttons[path]
+            self.assertEqual(button.text(), "+")
+            self.assertEqual(button.maximumWidth(), 22)
+            self.assertEqual(button.maximumHeight(), 22)
 
             name = next(
                 label
@@ -170,14 +179,10 @@ class NewFileAssignmentGuiTests(unittest.TestCase):
                 if label.text() == path
             )
             self.assertIn(color.lower(), name.styleSheet().lower())
-            assign_label = next(
-                label
-                for label in panel.findChildren(QLabel)
-                if label.text() == "Asignar a"
-            )
-            self.assertGreater(combo.x(), assign_label.x())
 
-        self.assertEqual(len(set(widths)), 1)
+        self.assertEqual(
+            set(panel._assign_buttons), {"hola.txt", "segundo.txt"}
+        )
 
     def test_indeterminate_section_is_distinct_and_green(self):
         window = self._window()
@@ -240,12 +245,37 @@ class NewFileAssignmentGuiTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.ref_b, "hola.txt")))
         self.assertFalse(os.path.exists(os.path.join(self.ref_a, "hola.txt")))
 
+    def test_assign_menu_lists_active_references(self):
+        window = self._window()
+        panel = window.inicio_panel
+        menu = panel.build_assign_menu("hola.txt")
+        actions = menu.actions()
+        self.assertEqual(actions[0].text(), "Asignar a")
+        self.assertFalse(actions[0].isEnabled())
+        references = [action for action in actions if action.text() in ("Principal", "Herramientas")]
+        self.assertEqual(
+            [action.text() for action in references],
+            ["Principal", "Herramientas"],
+        )
+        self.assertEqual(
+            [action.data() for action in references],
+            ["src_ref_a", "src_ref_b"],
+        )
+        menu.deleteLater()
+
+        panel.set_assignment_targets([])
+        empty_menu = panel.build_assign_menu("hola.txt")
+        empty_actions = empty_menu.actions()
+        self.assertEqual(empty_actions[0].text(), "Asignar a")
+        self.assertFalse(empty_actions[0].isEnabled())
+        empty = [action for action in empty_actions if action.text() == "Sin referencias activas"]
+        self.assertEqual(len(empty), 1)
+        self.assertFalse(empty[0].isEnabled())
+        empty_menu.deleteLater()
+
     def test_home_selector_performs_the_same_persistent_assignment(self):
         window = self._window()
-        combo = window.inicio_panel._assign_combos["hola.txt"]
-        index = combo.findData("src_ref_a")
-        self.assertGreater(index, 0)
-        combo.setCurrentIndex(index)
+        window.inicio_panel.assign_path("hola.txt", "src_ref_a")
 
         persisted = load_profile(self.profile.id)
         self.assertEqual(persisted.assignments, {"hola.txt": "src_ref_a"})

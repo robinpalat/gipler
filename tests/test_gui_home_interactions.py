@@ -8,15 +8,20 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import Qt
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication
 
 from gipler.gui.comparison_window import ComparisonWindow
-from gipler.gui.main_window import GiplerWindow
 from gipler.report import Row
+from .helpers import make_profile_window
 
 app = QApplication.instance() or QApplication([])
+
+SOURCES = [
+    {"id": "principal", "name": "Principal"},
+    {"id": "addons", "name": "Addons"},
+]
 
 
 def _row(path, axis_a="modified_in_dev", axis_b="tracked_clean",
@@ -26,13 +31,8 @@ def _row(path, axis_a="modified_in_dev", axis_b="tracked_clean",
 
 class HomeInteractionsTests(unittest.TestCase):
     def setUp(self):
-        self.settings = QSettings("Gipler", "Gipler")
-        self.old_destination = self.settings.value("inicio/repositorio")
-        self.old_view = self.settings.value("inicio/vista")
-        self.settings.setValue("inicio/repositorio", "principal")
-        self.settings.setValue("inicio/vista", "relevantes")
-        self.settings.sync()
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         root = self.tmp.name
         self.dev = os.path.join(root, "dev")
         self.principal = os.path.join(root, "principal")
@@ -56,30 +56,11 @@ class HomeInteractionsTests(unittest.TestCase):
         self._write(self.addons, "addon/orphan.py", "orphan addon")
         self._write(self.dev, "only-dev.txt", "new")
         self._write(self.principal, "only-repo.txt", "orphan")
-        self.window = GiplerWindow(
-            rows=self.rows,
-            meta={
-                "dev": self.dev,
-                "principal": self.principal,
-                "addons": self.addons,
-            },
-            snapshot={"dev": {}, "repos": {}},
+        self.window, self.patcher = make_profile_window(
+            root, self.rows, sources=SOURCES
         )
-
-    def tearDown(self):
-        self.window.close()
-        for child in self.window.findChildren(ComparisonWindow):
-            child.close()
-        self.tmp.cleanup()
-        if self.old_destination is None:
-            self.settings.remove("inicio/repositorio")
-        else:
-            self.settings.setValue("inicio/repositorio", self.old_destination)
-        if self.old_view is None:
-            self.settings.remove("inicio/vista")
-        else:
-            self.settings.setValue("inicio/vista", self.old_view)
-        self.settings.sync()
+        self.addCleanup(self.patcher.stop)
+        self.addCleanup(self.window.close)
 
     @staticmethod
     def _write(root, relative, contents):
@@ -108,13 +89,16 @@ class HomeInteractionsTests(unittest.TestCase):
         )
         app.processEvents()
 
+        dev_root = self.window.profile.work_dir
+        repo_root = self.window.meta["principal"]
+        self.assertTrue(panel.file_info.alignment() & Qt.AlignTop)
         text = panel.file_info.text()
         self.assertIn("Ruta relativa: dirA/shared.txt", text)
         self.assertIn("Estado A: modified_in_dev", text)
         self.assertIn("Estado B: tracked_clean", text)
-        self.assertIn(os.path.join(self.dev, "dirA/shared.txt"), text)
-        self.assertIn(os.path.join(self.principal, "dirA/shared.txt"), text)
-        self.assertIn("tamaño=5", text)
+        self.assertIn(os.path.join(dev_root, "dirA/shared.txt"), text)
+        self.assertIn(os.path.join(repo_root, "dirA/shared.txt"), text)
+        self.assertIn("tamaño=", text)
         self.assertIn("permisos=", text)
         self.assertIn("sha256=", text)
         self.assertEqual(self.window.selection_ctrl.keys, {("principal", "copy-target.txt")})
@@ -125,8 +109,12 @@ class HomeInteractionsTests(unittest.TestCase):
         panel = self.window.inicio_panel
         item = self._item_for("dirB/shared.txt")
         panel.list.setCurrentItem(item)
-        self.assertIn(os.path.join(self.dev, "dirB/shared.txt"), panel.file_info.text())
-        self.assertNotIn(os.path.join(self.principal, "dirA/shared.txt"), panel.file_info.text())
+        dev_root = self.window.profile.work_dir
+        self.assertIn(os.path.join(dev_root, "dirB/shared.txt"), panel.file_info.text())
+        self.assertNotIn(
+            os.path.join(self.window.meta["principal"], "dirA/shared.txt"),
+            panel.file_info.text(),
+        )
         self.assertIn("Existencia física — Dev: sí  |  Repositorio: no", panel.file_info.text())
 
     def test_context_menu_selection_and_explorer_action(self):
@@ -145,14 +133,15 @@ class HomeInteractionsTests(unittest.TestCase):
         target_url = open_url.call_args.args[0]
         self.assertEqual(
             target_url.toLocalFile(),
-            os.path.join(self.addons, "addon"),
+            os.path.join(self.window.profile.work_dir, "addon"),
         )
 
     def test_double_click_opens_existing_comparison_for_both_repositories(self):
-        for path, destination, repo_root in (
-            ("dirA/shared.txt", "principal", self.principal),
-            ("addon/plugin.py", "addons", self.addons),
+        for path, destination in (
+            ("dirA/shared.txt", "principal"),
+            ("addon/plugin.py", "addons"),
         ):
+            repo_root = self.window.meta[destination]
             selector = self.window.inicio_panel.repository_selector
             selector.setCurrentIndex(selector.findData(destination))
             item = self._item_for(path, destination)
@@ -164,7 +153,7 @@ class HomeInteractionsTests(unittest.TestCase):
             ]
             self.assertTrue(opened)
             self.assertEqual(opened[-1].repo_root, repo_root)
-            self.assertEqual(opened[-1].dev_root, self.dev)
+            self.assertEqual(opened[-1].dev_root, self.window.profile.work_dir)
             opened[-1].close()
 
     def test_comparison_without_counterpart(self):
@@ -180,25 +169,20 @@ class HomeInteractionsTests(unittest.TestCase):
             self.assertIn(expected, text)
             window.close()
 
-    def test_exclude_uses_existing_persistence_and_refreshes_home(self):
+    def test_exclude_uses_profile_persistence_and_refreshes_home(self):
         item = self._item_for("only-dev.txt")
         self.window.selection_ctrl.add(("principal", "only-dev.txt"))
         self.window.ops_cache = ["prepared"]
-        ignore_file = os.path.join(self.tmp.name, "config", "ignore.toml")
-        with patch("gipler.ignore.ignore_path", return_value=ignore_file):
+        with patch("gipler.profile.add_exclusion", return_value=self.window.profile) as add:
             menu = self.window.inicio_panel.context_menu_for(item)
             menu.actions()[2].trigger()
             app.processEvents()
-
-        self.assertFalse(any(row.path == "only-dev.txt" for row in self.window.rows))
-        self.assertFalse(any(
-            self.window.inicio_panel.list.item(index).text() == "only-dev.txt"
-            for index in range(self.window.inicio_panel.list.count())
-        ))
+        self.assertTrue(add.called)
+        self.assertEqual(
+            add.call_args.args[0], self.window.profile.id
+        )
         self.assertEqual(self.window.selection_ctrl.keys, set())
         self.assertEqual(self.window.ops_cache, [])
-        with open(ignore_file, encoding="utf-8") as file:
-            self.assertIn("only-dev.txt", file.read())
 
     def test_relevance_filter_uses_analysis_states_and_incidences(self):
         relevant = [
@@ -231,9 +215,37 @@ class HomeInteractionsTests(unittest.TestCase):
             "ambiguous.xml",
         })
 
-    def test_repository_selector_scopes_items_and_persists(self):
+    def test_main_navigation_uses_editorial_nav_buttons(self):
+        from gipler.gui.navbutton import EditorialNavButton
+
+        window = self.window
+        self.assertTrue(
+            all(
+                isinstance(button, EditorialNavButton)
+                for button in window.nav_buttons.values()
+            )
+        )
+        self.assertTrue(
+            all(
+                isinstance(button, EditorialNavButton)
+                for button in window.repo_buttons.values()
+            )
+        )
+        if hasattr(window, "admin_buttons"):
+            self.assertTrue(
+                all(
+                    isinstance(button, EditorialNavButton)
+                    for button in window.admin_buttons.values()
+                )
+            )
+        self.assertEqual(window.nav_toolbar.objectName(), "navigationToolbar")
+
+    def test_repository_selector_scopes_items(self):
         selector = self.window.inicio_panel.repository_selector
-        self.assertEqual([selector.itemData(i) for i in range(selector.count())], ["principal", "addons"])
+        self.assertEqual(
+            [selector.itemData(i) for i in range(selector.count())],
+            ["principal", "addons"],
+        )
         self.assertEqual(self._visible_paths(), {
             "dirA/shared.txt", "dirB/shared.txt", "only-dev.txt", "only-repo.txt",
         })
@@ -241,19 +253,8 @@ class HomeInteractionsTests(unittest.TestCase):
         selector.setCurrentIndex(selector.findData("addons"))
         self.assertEqual(self._visible_paths(), {"addon/plugin.py", "addon/orphan.py"})
         self.assertEqual(
-            self.settings.value("inicio/repositorio"),
-            "addons",
+            self.window.inicio_panel.counters["nuevos"][1].text(), "Nuevos en Dev: 0"
         )
-        self.assertEqual(self.window.inicio_panel.counters["nuevos"][1].text(), "Nuevos en Dev: 0")
-
-        second = GiplerWindow(
-            rows=self.rows,
-            meta={"dev": self.dev, "principal": self.principal, "addons": self.addons},
-        )
-        try:
-            self.assertEqual(second.inicio_panel.repository_selector.currentData(), "addons")
-        finally:
-            second.close()
 
     def test_four_view_modes_combine_with_both_repository_destinations(self):
         rows = [
@@ -301,7 +302,7 @@ class HomeInteractionsTests(unittest.TestCase):
                     row = panel.list.item(index).data(Qt.UserRole)
                     self.assertEqual(row.destination, destination)
 
-    def test_view_selector_is_accessible_and_persisted(self):
+    def test_view_selector_is_accessible(self):
         panel = self.window.inicio_panel
         self.assertEqual(
             [panel.view_selector.itemData(index) for index in range(panel.view_selector.count())],
@@ -309,16 +310,6 @@ class HomeInteractionsTests(unittest.TestCase):
         )
         self.assertEqual(panel.repository_selector.accessibleName(), "Repositorio de Inicio")
         self.assertEqual(panel.view_selector.accessibleName(), "Tipo de vista de Inicio")
-        panel.view_selector.setCurrentIndex(panel.view_selector.findData("todo"))
-        self.assertEqual(self.settings.value("inicio/vista"), "todo")
-        second = GiplerWindow(
-            rows=self.rows,
-            meta={"dev": self.dev, "principal": self.principal, "addons": self.addons},
-        )
-        try:
-            self.assertEqual(second.inicio_panel.view_selector.currentData(), "todo")
-        finally:
-            second.close()
 
     def test_interactions_remain_available_in_each_view(self):
         rows = [
@@ -370,29 +361,30 @@ class HomeInteractionsTests(unittest.TestCase):
             _row("parent/child.txt", "new_in_dev", "untracked"),
             _row("keep.txt", "modified_in_dev", "tracked_clean"),
         ]
-        from gipler import ignore
-        with patch.object(ignore, "load_patterns", return_value=["parent/"]):
-            self.window.inicio_panel.update_from(rows)
+        self.window.inicio_panel.update_from(rows)
 
-        self.assertEqual(self._visible_paths(), {"keep.txt"})
+        self.assertEqual(self._visible_paths(), {"parent/child.txt", "keep.txt"})
         self.assertEqual(
             self.window.inicio_panel.counters["advertencias"][1].text(),
             "Con advertencias/incidencias: 0",
         )
         self.assertEqual(
             self.window.inicio_panel.counters["nuevos"][1].text(),
-            "Nuevos en Dev: 0",
+            "Nuevos en Dev: 1",
         )
 
-    def test_excluded_rows_and_directory_descendants_are_not_prepared(self):
-        from gipler import copy_engine, ignore
+    def test_excluded_rows_are_not_prepared(self):
+        from gipler import copy_engine
 
         rows = [
-            _row("private/child.txt", "new_in_dev", "untracked"),
+            _row("private/child.txt", "new_in_dev", "untracked",
+                 incidences=("excluded",)),
             _row("manifest-excluded.txt", "new_in_dev", "untracked",
                  incidences=("excluded",)),
             _row("keep.txt", "new_in_dev", "untracked"),
         ]
+        for row in rows:
+            row.selection_key = (row.destination, row.path)
         self.window.rows = rows
         self.window.selection_ctrl.keys.clear()
         self.window.selection_ctrl.keys.update(
@@ -404,14 +396,16 @@ class HomeInteractionsTests(unittest.TestCase):
             captured["selection"] = set(selection)
             return []
 
-        with patch.object(ignore, "load_patterns", return_value=["private/"]), \
-             patch.object(copy_engine, "build_operations", side_effect=capture_selection):
+        with patch(
+            "gipler.profile_analysis.ProfileAnalysis.copy_rows", return_value=rows
+        ), patch.object(copy_engine, "build_operations", side_effect=capture_selection):
             self.assertEqual(self.window.prepare_operations(), [])
 
         self.assertEqual(captured["selection"], {("principal", "keep.txt")})
 
     def test_blocked_prepared_operation_is_relevant(self):
         blocked = _row("blocked.txt", "identical", "tracked_clean")
+        blocked.selection_key = (blocked.destination, blocked.path)
         operation = SimpleNamespace(
             destination=blocked.destination,
             path=blocked.path,

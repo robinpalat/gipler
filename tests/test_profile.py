@@ -490,16 +490,12 @@ class IgnorePathParameterTests(unittest.TestCase):
         ignore.add_pattern("dos/", self.custom)
         self.assertEqual(ignore.load_patterns(self.custom), ["uno.txt", "dos/"])
 
-    def test_default_path_untouched_by_explicit_writes(self):
-        default = ignore.ignore_path()
-        existed = os.path.isfile(default)
-        with open(default, "rb") as f:
-            before = f.read() if existed else None
+    def test_explicit_write_does_not_touch_other_paths(self):
+        other = os.path.join(self.tmp.name, "other.toml")
         ignore.save_patterns(["uno.txt"], self.custom)
-        self.assertEqual(os.path.isfile(default), existed)
-        if existed:
-            with open(default, "rb") as f:
-                self.assertEqual(f.read(), before)
+        self.assertFalse(os.path.exists(other))
+        self.assertEqual(ignore.load_patterns(self.custom), ["uno.txt"])
+        self.assertEqual(ignore.load_patterns(other), [])
 
     def test_remove_pattern_writes_only_on_change(self):
         ignore.save_patterns(["uno.txt"], self.custom)

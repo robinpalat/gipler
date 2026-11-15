@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout
 
+from gipler.copy_policy import describe_blockers
+
 
 class OperationsDialog(QDialog):
     HEADER = ["Ruta", "Origen", "Destino", "Estado", "Advertencias"]
@@ -40,7 +42,7 @@ class OperationsDialog(QDialog):
         self.table.setRowCount(len(ops))
         n_copiable = 0
         for r, o in enumerate(ops):
-            warn = "; ".join(o.blockers) if o.blockers else ""
+            warn = "; ".join(describe_blockers(o.blockers)) if o.blockers else ""
             if o.status == "copiable":
                 n_copiable += 1
             for c, v in enumerate((o.path, o.src, o.dst, o.status, warn)):

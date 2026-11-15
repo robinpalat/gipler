@@ -4,39 +4,29 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import tempfile
+import time
 import unittest
 
 from PySide6.QtWidgets import QApplication
 
 from gipler.gui.main_window import GiplerWindow
-from gipler.report import Row
+from .helpers import make_profile, write
 
 app = QApplication.instance() or QApplication([])
-
-
-def _row(path, a, b, owner="núcleo", dest="principal", inc=()):
-    return Row(path, owner, dest, a, b, list(inc))
 
 
 class Phase5Tests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        root = self.tmp.name
-        self.dev = os.path.join(root, "dev")
-        self.repo = os.path.join(root, "repo")
-        os.makedirs(self.dev)
-        os.makedirs(self.repo)
-        self.rows = [
-            _row("new.txt", "new_in_dev", "untracked"),
-            _row("same.txt", "identical", "tracked_clean"),
-            _row("local.txt", "modified_in_dev", "tracked_modified"),
-        ]
-        for name in ("new.txt", "same.txt", "local.txt"):
-            with open(os.path.join(self.dev, name), "w") as f:
-                f.write(name)
-        for name in ("same.txt", "local.txt"):
-            with open(os.path.join(self.repo, name), "w") as f:
-                f.write(name)
+        self.addCleanup(self.tmp.cleanup)
+        self.profile, self.dev, roots = make_profile(
+            self.tmp.name,
+            work_files={"new.txt": "new\n", "same.txt": "same\n", "local.txt": "dev\n"},
+            sources=[{"name": "Ref", "files": {"same.txt": "same\n", "local.txt": "same\n"}}],
+            assignments={"new.txt": "src_000000"},
+        )
+        self.repo = roots["src_000000"]
+        write(os.path.join(self.repo, "local.txt"), "local\n")
         self.w = None
 
     def tearDown(self):
@@ -45,34 +35,27 @@ class Phase5Tests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _window(self):
-        self.w = GiplerWindow(
-            rows=self.rows,
-            meta={"dev": self.dev, "principal": self.repo, "addons": self.repo},
-            snapshot={"dev": {}, "repos": {"principal": {}}},
-        )
+        self.w = GiplerWindow(profile=self.profile)
         return self.w
 
     def test_execute_only_copiable(self):
         w = self._window()
-        w.selection_ctrl.keys.add(("principal", "new.txt"))
+        w.selection_ctrl.keys.add(("src_000000", "new.txt"))
         ops = w.prepare_operations()
         self.assertEqual(len(ops), 1)
         self.assertEqual(ops[0].status, "copiable")
         w.authorize_and_execute(list(ops))
-        # Esperar QThread.
         for _ in range(100):
-            import time
-
             app.processEvents()
             if not w.is_executing and getattr(w, "results", []):
                 break
             time.sleep(0.05)
-        self.assertFalse(os.path.exists(os.path.join(self.repo, "new.txt")) is False)
-        self.assertEqual(open(os.path.join(self.repo, "new.txt")).read(), "new.txt")
+        self.assertTrue(os.path.exists(os.path.join(self.repo, "new.txt")))
+        self.assertEqual(open(os.path.join(self.repo, "new.txt")).read(), "new\n")
 
     def test_cancel_no_write(self):
         w = self._window()
-        w.selection_ctrl.keys.add(("principal", "new.txt"))
+        w.selection_ctrl.keys.add(("src_000000", "new.txt"))
         ops = w.prepare_operations()
         from gipler.copy_engine import execute_operations
         res = execute_operations(ops, authorized=False)
@@ -81,15 +64,18 @@ class Phase5Tests(unittest.TestCase):
 
     def test_blocked_never_executed(self):
         w = self._window()
-        with open(os.path.join(self.dev, "local.txt"), "w") as f:
-            f.write("DEV")
-        with open(os.path.join(self.repo, "local.txt"), "w") as f:
-            f.write("REPO")
-        w.selection_ctrl.keys.add(("principal", "local.txt"))
+        w.selection_ctrl.keys.add(("src_000000", "new.txt"))
         ops = w.prepare_operations()
-        self.assertEqual(ops[0].status, "bloqueada")
+        self.assertEqual(ops[0].status, "copiable")
+        # El destino aparece tras la preparación: la ejecución debe bloquearla.
+        write(os.path.join(self.repo, "new.txt"), "intruso\n")
         w.authorize_and_execute(list(ops))
-        self.assertEqual(open(os.path.join(self.repo, "local.txt")).read(), "REPO")
+        for _ in range(100):
+            app.processEvents()
+            if not w.is_executing:
+                break
+            time.sleep(0.05)
+        self.assertEqual(open(os.path.join(self.repo, "new.txt")).read(), "intruso\n")
 
     def test_simultaneous_execution_prevented(self):
         w = self._window()

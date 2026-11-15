@@ -10,34 +10,23 @@ from PySide6.QtWidgets import QApplication
 
 from gipler.gui.main_window import GiplerWindow
 from gipler.gui.operations_dialog import OperationsDialog
-from gipler.report import Row
+from .helpers import make_profile, write
 
 app = QApplication.instance() or QApplication([])
-
-
-def _row(path, a, b, owner="núcleo", dest="principal", inc=()):
-    return Row(path, owner, dest, a, b, list(inc))
 
 
 class Phase4Tests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        root = self.tmp.name
-        self.dev = os.path.join(root, "dev")
-        self.repo = os.path.join(root, "repo")
-        os.makedirs(self.dev)
-        os.makedirs(self.repo)
-        self.rows = [
-            _row("new.txt", "new_in_dev", "untracked"),
-            _row("same.txt", "identical", "tracked_clean"),
-            _row("local.txt", "modified_in_dev", "tracked_modified"),
-        ]
-        for name in ("new.txt", "same.txt", "local.txt"):
-            with open(os.path.join(self.dev, name), "w") as f:
-                f.write(name)
-        for name in ("same.txt", "local.txt"):
-            with open(os.path.join(self.repo, name), "w") as f:
-                f.write(name)
+        self.addCleanup(self.tmp.cleanup)
+        self.profile, _work, roots = make_profile(
+            self.tmp.name,
+            work_files={"new.txt": "new\n", "same.txt": "same\n", "local.txt": "same\n"},
+            sources=[{"name": "Ref", "files": {"same.txt": "same\n", "local.txt": "same\n"}}],
+            assignments={"new.txt": "src_000000"},
+        )
+        write(os.path.join(roots["src_000000"], "local.txt"), "local\n")
+        self.destination_root = roots["src_000000"]
         self.w = None
 
     def tearDown(self):
@@ -46,11 +35,7 @@ class Phase4Tests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _window(self):
-        self.w = GiplerWindow(
-            rows=self.rows,
-            meta={"dev": self.dev, "principal": self.repo, "addons": self.repo},
-            snapshot={"dev": {}, "repos": {}},
-        )
+        self.w = GiplerWindow(profile=self.profile)
         return self.w
 
     def test_selection_toggle_and_prepare(self):
@@ -58,39 +43,33 @@ class Phase4Tests(unittest.TestCase):
         w.selection_ctrl.clear()
         from gipler.gui.selection import SelectionController
         sel = SelectionController()
-        sel.add(("principal", "new.txt"))
-        # La preparación usa el controlador (selección = intención).
+        sel.add(("src_000000", "new.txt"))
         w.selection_ctrl = sel
-        w.snapshot = {"dev": {}, "repos": {"principal": {}}}
         ops = w.prepare_operations()
         self.assertEqual(len(ops), 1)
         self.assertEqual(ops[0].status, "copiable")
-        # No se escribió nada en el repo.
-        self.assertEqual(os.listdir(self.repo), ["local.txt", "same.txt"])
+        self.assertFalse(os.path.exists(os.path.join(self.destination_root, "new.txt")))
 
     def test_cancel_keeps_selection(self):
         w = self._window()
-        w.selection_ctrl.keys.add(("principal", "new.txt"))
+        w.selection_ctrl.keys.add(("src_000000", "new.txt"))
         dlg = OperationsDialog()
         dlg.set_operations([])
         dlg.reject()
-        self.assertIn(("principal", "new.txt"), w.selection_ctrl.keys)
+        self.assertIn(("src_000000", "new.txt"), w.selection_ctrl.keys)
 
     def test_safe_selection_helper(self):
         from gipler.gui.selection import SelectionController
         sel = SelectionController()
-        try:
-            self.assertIsInstance(sel, SelectionController)
-        finally:
-            pass
+        self.assertIsInstance(sel, SelectionController)
 
     def test_dialog_summary_counts(self):
         from gipler.copy_engine import Op
         from gipler.report import Row as R
         dlg = OperationsDialog()
         ops = [
-            Op(R("a", "núcleo", "principal", "new_in_dev", "untracked", []), "/dev", {"principal": "/repo"}, "copiable", []),
-            Op(R("b", "núcleo", "principal", "identical", "tracked_clean", []), "/dev", {"principal": "/repo"}, "identica", ["sin_cambios"]),
+            Op(R("a", "núcleo", "src_000000", "new_in_dev", "untracked", []), "/dev", {"src_000000": "/repo"}, "copiable", []),
+            Op(R("b", "núcleo", "src_000000", "identical", "tracked_clean", []), "/dev", {"src_000000": "/repo"}, "identica", ["sin_cambios"]),
         ]
         dlg.set_operations(ops)
         self.assertIn("copiable=1", dlg.summary())

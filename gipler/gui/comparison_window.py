@@ -8,12 +8,81 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLabel, QLineEdit, QMainWindow, QSplitter, QVBoxLayout, QWidget
+from PySide6.QtCore import QRect, Qt
+from PySide6.QtGui import QGuiApplication, QIcon, QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QSplitter,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from gipler.comparator import make_diff
 from gipler.gui.diff_view import DiffViewer
 from gipler.report import Row
+
+
+DEFAULT_DIFF_GEOMETRY = QRect(0, 0, 1240, 800)
+MIN_DIFF_WIDTH = 480
+MIN_DIFF_HEIGHT = 320
+SAFE_MARGIN = 24
+
+
+def _overlap_area(rect: QRect, area: QRect) -> int:
+    intersection = rect.intersected(area)
+    if intersection.isEmpty():
+        return 0
+    return intersection.width() * intersection.height()
+
+
+def _screen_for_rect(rect: QRect):
+    screens = QGuiApplication.screens()
+    if not screens:
+        return None
+    return max(screens, key=lambda screen: _overlap_area(rect, screen.availableGeometry()))
+
+
+def _safe_geometry(screen) -> QRect:
+    area = screen.availableGeometry()
+    width = min(
+        DEFAULT_DIFF_GEOMETRY.width(),
+        max(MIN_DIFF_WIDTH, area.width() - 2 * SAFE_MARGIN),
+    )
+    height = min(
+        DEFAULT_DIFF_GEOMETRY.height(),
+        max(MIN_DIFF_HEIGHT, area.height() - 2 * SAFE_MARGIN),
+    )
+    width = min(width, area.width())
+    height = min(height, area.height())
+    return QRect(
+        area.x() + (area.width() - width) // 2,
+        area.y() + (area.height() - height) // 2,
+        width,
+        height,
+    )
+
+
+def _clamp_geometry(rect: QRect, area: QRect) -> QRect:
+    width = min(rect.width(), area.width())
+    height = min(rect.height(), area.height())
+    x = min(max(rect.x(), area.left()), area.right() - width + 1)
+    y = min(max(rect.y(), area.top()), area.bottom() - height + 1)
+    return QRect(x, y, width, height)
+
+
+def _geometry_is_usable(rect: QRect, area: QRect) -> bool:
+    if rect.width() < MIN_DIFF_WIDTH or rect.height() < MIN_DIFF_HEIGHT:
+        return False
+    visible = rect.intersected(area)
+    if visible.width() < 160 or visible.height() < 120:
+        return False
+    title_bar = QRect(rect.x(), rect.y(), rect.width(), min(40, rect.height()))
+    return not title_bar.intersected(area).isEmpty()
+
 
 class ComparisonWindow(QMainWindow):
     def __init__(self, row: Row, dev_root: str, repo_root: str, parent=None):
@@ -26,32 +95,66 @@ class ComparisonWindow(QMainWindow):
         s = get_settings()
         geometry = s.value("diff_window/geometry")
         state = s.value("diff_window/state")
-        if geometry:
-            self.restoreGeometry(geometry)
+        restored = bool(geometry) and self.restoreGeometry(geometry)
         if state:
             self.restoreState(state)
-        if not geometry:
-            self.resize(1240, 800)
+        if restored:
+            self._ensure_visible_geometry()
+        else:
+            self._apply_safe_geometry()
         self.setWindowTitle(f"{row.path}")
         from gipler.gui.comparison_header import summary_text
-        from gipler.gui.inspector import Inspector
 
-        dev_m = Inspector._meta(os.path.join(dev_root, row.path))
-        repo_path = os.path.join(repo_root, row.path) if repo_root else ""
-        repo_m = Inspector._meta(repo_path) if repo_path else {"existe": "sin destino"}
-        title_text = summary_text(row, dev_m, repo_m)
+        title_text = summary_text(row)
         from PySide6.QtWidgets import QLabel
 
         title_label = QLabel(title_text)
         title_label.setWordWrap(True)
+        title_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.diff = DiffViewer()
         self.search = QLineEdit()
         self.search.setPlaceholderText("Buscar en diferencias…")
+        self.search.setFixedWidth(280)
+        self.search.setVisible(False)
         self.search.textChanged.connect(self._find)
+        self.search_close = QToolButton()
+        self.search_close.setText("×")
+        self.search_close.setToolTip("Cerrar búsqueda")
+        self.search_close.setAccessibleName("Cerrar búsqueda")
+        self.search_close.setAutoRaise(True)
+        self.search_close.setFixedSize(24, 24)
+        self.search_close.setVisible(False)
+        self.search_close.clicked.connect(self._close_search)
+        self.search_button = QToolButton()
+        search_icon = QIcon.fromTheme("edit-find")
+        if search_icon.isNull():
+            self.search_button.setText("⌕")
+        else:
+            self.search_button.setIcon(search_icon)
+        self.search_button.setToolTip("Buscar en diferencias (Ctrl+F)")
+        self.search_button.setAccessibleName("Buscar en diferencias")
+        self.search_button.setAutoRaise(True)
+        self.search_button.setFixedSize(28, 28)
+        self.search_button.clicked.connect(self._toggle_search)
+        compact_button_style = (
+            "QToolButton { border: none; background: transparent; padding: 2px; }"
+        )
+        self.search_button.setStyleSheet(compact_button_style)
+        self.search_close.setStyleSheet(compact_button_style)
+        self.search_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
+        self.search_shortcut.activated.connect(self._open_search)
         self.vertical_splitter = QSplitter(Qt.Vertical)
         info_box = QWidget()
         vert = QVBoxLayout(info_box)
-        vert.addWidget(title_label)
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(6)
+        header_row.addWidget(title_label, 1)
+        header_row.addWidget(self.search)
+        header_row.addWidget(self.search_close)
+        header_row.addWidget(self.search_button)
+        vert.addLayout(header_row)
+        vert.addStretch(1)
         self.vertical_splitter.addWidget(info_box)
         self.vertical_splitter.addWidget(self.diff)
         self.vertical_splitter.setChildrenCollapsible(False)
@@ -60,13 +163,52 @@ class ComparisonWindow(QMainWindow):
         vs_state = s.value("diff_window/vertical_splitter_state")
         if vs_state:
             self.vertical_splitter.restoreState(vs_state)
+        else:
+            self.vertical_splitter.setSizes([90, 710])
         self.vertical_splitter.splitterMoved.connect(self._on_vsplit_moved)
         central = QWidget()
         layout = QVBoxLayout(central)
-        layout.addWidget(self.search)
         layout.addWidget(self.vertical_splitter)
         self.setCentralWidget(central)
         self._fill()
+
+    def _apply_safe_geometry(self) -> None:
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            self.setGeometry(DEFAULT_DIFF_GEOMETRY)
+            return
+        self.setGeometry(_safe_geometry(screen))
+
+    def _ensure_visible_geometry(self) -> None:
+        frame = self.frameGeometry()
+        screen = _screen_for_rect(frame)
+        if screen is None:
+            self._apply_safe_geometry()
+            return
+        area = screen.availableGeometry()
+        if not _geometry_is_usable(frame, area):
+            self.setGeometry(_safe_geometry(screen))
+            return
+        clamped = _clamp_geometry(frame, area)
+        if clamped != frame:
+            self.setGeometry(clamped)
+
+    def _open_search(self) -> None:
+        self.search.setVisible(True)
+        self.search_close.setVisible(True)
+        self.search.setFocus()
+        self.search.selectAll()
+
+    def _close_search(self) -> None:
+        self.search.clear()
+        self.search.setVisible(False)
+        self.search_close.setVisible(False)
+
+    def _toggle_search(self) -> None:
+        if self.search.isVisible():
+            self._close_search()
+        else:
+            self._open_search()
 
     def _on_vsplit_moved(self, _, index) -> None:
         from gipler.config import get_settings
@@ -85,6 +227,7 @@ class ComparisonWindow(QMainWindow):
         s.setValue("diff_window/state", self.saveState())
         s.setValue("diff_window/vertical_splitter_state", self.vertical_splitter.saveState())
         s.setValue("diff_window/splitter_state", self.diff.splitter.saveState())
+        s.sync()
         super().closeEvent(event)
 
     def _fill(self) -> None:

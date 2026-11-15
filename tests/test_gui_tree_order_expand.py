@@ -3,16 +3,18 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import tempfile
 import unittest
-from unittest.mock import patch
 
 from PySide6.QtCore import QModelIndex, Qt, qInstallMessageHandler
 from PySide6.QtWidgets import QApplication
 
-from gipler.gui.main_window import GiplerWindow
 from gipler.report import Row
+from .helpers import make_profile_window
 
 app = QApplication.instance() or QApplication([])
+
+SOURCES = [{"id": "principal", "name": "Principal"}, {"id": "addons", "name": "Addons"}]
 
 
 def _row(path, axis_a="identical", destination="principal", incidences=()):
@@ -35,16 +37,16 @@ class TreeOrderingAndExpansionTests(unittest.TestCase):
             _row("addons/quiet/nothing.txt", destination="addons"),
             _row("root-a.txt"),
         ]
-        self.window = GiplerWindow(
-            rows=self.rows,
-            meta={"dev": "", "principal": "", "addons": ""},
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.window, self.patcher = make_profile_window(
+            self.tmp.name, self.rows, sources=SOURCES
         )
+        self.addCleanup(self.patcher.stop)
+        self.addCleanup(self.window.close)
         self.window.resize(1000, 700)
         self.window.show()
         app.processEvents()
-
-    def tearDown(self):
-        self.window.close()
 
     @staticmethod
     def _index_for_path(proxy, path):
@@ -154,13 +156,8 @@ class TreeOrderingAndExpansionTests(unittest.TestCase):
         self.assertFalse(any("invalid" in message.lower() and "index" in message.lower() for message in messages))
 
     def test_reanalysis_restores_relevant_expansion(self):
-        info = {
-            "meta": {"dev": "", "principal": "", "addons": ""},
-            "warnings": [],
-            "snapshot": {"dev": {}, "repos": {}},
-        }
-        with patch("gipler.analysis.analyze", return_value=("", self.rows, info)):
-            self.window.reanalyze()
+        self.window.reanalyze()
+        app.processEvents()
         for proxy, tree in (
             (self.window.proxy, self.window.dev_panel.tree),
             (self.window.repo_proxy, self.window.dest_panel.tree),

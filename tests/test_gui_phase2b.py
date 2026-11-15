@@ -3,23 +3,32 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import tempfile
 import unittest
 
-from PySide6.QtCore import QModelIndex, Qt
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
-from gipler.gui.main_window import GiplerWindow
 from gipler.gui.models.comparison_tree import (
     STATE_COLORS,
     color_for_row,
 )
 from gipler.report import Row
+from .helpers import make_profile_window
 
 app = QApplication.instance() or QApplication([])
 
 
 def _row(path, a, b, owner="núcleo", dest="principal", inc=()):
     return Row(path, owner, dest, a, b, list(inc))
+
+
+ROWS = [
+    _row("new.txt", "new_in_dev", "untracked"),
+    _row("same.txt", "identical", "tracked_clean"),
+]
+
+SOURCES = [{"id": "principal", "name": "Principal"}, {"id": "addons", "name": "Addons"}]
 
 
 class ColorTests(unittest.TestCase):
@@ -49,41 +58,16 @@ class ColorTests(unittest.TestCase):
 
 class Phase4AdjustTests(unittest.TestCase):
     def setUp(self):
-        import tempfile
-
         self.tmp = tempfile.TemporaryDirectory()
-        root = self.tmp.name
-        self.dev = os.path.join(root, "dev")
-        self.repo = os.path.join(root, "repo")
-        os.makedirs(self.dev)
-        os.makedirs(self.repo)
-        self.rows = [
-            _row("new.txt", "new_in_dev", "untracked"),
-            _row("same.txt", "identical", "tracked_clean"),
-        ]
-        for name in ("new.txt", "same.txt"):
-            with open(os.path.join(self.dev, name), "w") as f:
-                f.write(name)
-        with open(os.path.join(self.repo, "same.txt"), "w") as f:
-            f.write("same.txt")
-
-    def tearDown(self):
-        if getattr(self, "w", None):
-            self.w.close()
-        self.tmp.cleanup()
-
-    def _window(self):
-        self.w = GiplerWindow(
-            rows=self.rows,
-            meta={"dev": self.dev, "principal": self.repo, "addons": self.repo},
-            snapshot={"dev": {}, "repos": {}},
-        )
-        return self.w
+        self.addCleanup(self.tmp.cleanup)
+        self.w, self.patcher = make_profile_window(self.tmp.name, ROWS, sources=SOURCES)
+        self.addCleanup(self.patcher.stop)
+        self.addCleanup(self.w.close)
 
     def test_datachanged_on_check_uncheck(self):
         from PySide6.QtTest import QSignalSpy
 
-        w = self._window()
+        w = self.w
         spy = QSignalSpy(w.tree_model.dataChanged)
         idx = w.tree_model.index(0, 0)
         w.tree_model.setData(idx, Qt.Checked, Qt.CheckStateRole)
@@ -94,7 +78,7 @@ class Phase4AdjustTests(unittest.TestCase):
         self.assertGreaterEqual(spy.count(), 2)
 
     def test_selection_change_invalidates_cache(self):
-        w = self._window()
+        w = self.w
         w.selection_ctrl.keys.add(("principal", "new.txt"))
         w.ops_cache = ["fake"]
         before = set(w.selection_ctrl.keys)
@@ -103,7 +87,7 @@ class Phase4AdjustTests(unittest.TestCase):
         self.assertEqual(w.ops_cache, [])
 
     def test_no_invalidation_when_unchanged(self):
-        w = self._window()
+        w = self.w
         w.ops_cache = ["keep"]
         before = set(w.selection_ctrl.keys)
         w.selection_ctrl.toggle(("principal", "new.txt"))
@@ -112,14 +96,14 @@ class Phase4AdjustTests(unittest.TestCase):
         self.assertEqual(w.ops_cache, ["keep"])
 
     def test_navigation_does_not_invalidate(self):
-        w = self._window()
+        w = self.w
         w.ops_cache = ["keep"]
         idx = w.tree_model.index(0, 0)
         w._on_selection_changed(type("S", (), {"indexes": lambda self: [idx]})(), None)
         self.assertEqual(w.ops_cache, ["keep"])
 
     def test_cancel_dialog_keeps_cache(self):
-        w = self._window()
+        w = self.w
         w.ops_cache = ["keep"]
         from gipler.gui.operations_dialog import OperationsDialog
         dlg = OperationsDialog()
@@ -128,7 +112,7 @@ class Phase4AdjustTests(unittest.TestCase):
         self.assertEqual(w.ops_cache, ["keep"])
 
     def test_tabs_and_filters_keep_cache(self):
-        w = self._window()
+        w = self.w
         w.ops_cache = ["keep"]
         w.set_destination("addons")
         self.assertEqual(w.ops_cache, ["keep"])
@@ -136,44 +120,55 @@ class Phase4AdjustTests(unittest.TestCase):
         self.assertEqual(w.ops_cache, ["keep"])
 
     def test_selection_sync_no_crash(self):
-        w = self._window()
+        w = self.w
         w.tree_model.set_rows([
             _row("a.sh", "modified_in_dev", "tracked_clean"),
             _row("b.txt", "identical", "tracked_clean"),
         ], "principal")
-        # Seleccionar vía índice proxy de Dev: no debe lanzar TypeError.
         idx = w.proxy.index(0, 0)
         try:
             w.dev_panel.tree.selectionModel().setCurrentIndex(idx, __import__('PySide6.QtCore', fromlist=['QItemSelectionModel']).QItemSelectionModel.SelectionFlag.Current)
         except TypeError:
             self.fail("setCurrentIndex con SelectionFlag lanzando TypeError")
-        # Sincronización del panel Repo no debe lanzar excepción.
         w.dest_panel.tree.selectionModel().setCurrentIndex(w.repo_proxy.index(0, 0), __import__('PySide6.QtCore', fromlist=['QItemSelectionModel']).QItemSelectionModel.SelectionFlag.Current)
 
     def test_click_checkbox_interaction(self):
         from PySide6.QtTest import QTest
         from PySide6.QtCore import QPoint
 
-        w = self._window()
+        w = self.w
         model = w.tree_model
-        idx = w.proxy.index(0, 0)  # índice proxy con destino activo
-        # Clic real sobre la casilla del explorador (posición exacta).
+        idx = w.proxy.index(0, 0)
         pos = w.dev_panel.tree.visualRect(idx).topLeft() + QPoint(8, 5)
         QTest.mouseClick(w.dev_panel.tree.viewport(), Qt.LeftButton, Qt.NoModifier, pos)
         app.processEvents()
-        node = model.node_at(w.proxy.mapToSource(idx))
         self.assertEqual(model.data(w.proxy.mapToSource(idx), Qt.CheckStateRole), Qt.CheckState.Checked)
 
-    def test_space_and_enter_on_focused(self):
-        pass  # Enter no alterna casillas (Qt no lo hace); espacio no lo realiza la vista.
+    def test_space_toggles_checkbox(self):
+        from PySide6.QtTest import QTest
+        from PySide6.QtCore import Qt
 
-    def test_reanalyze_invalidates(self):
-        w = self._window()
-        w.selection_ctrl.keys.add(("principal", "new.txt"))
+        w = self.w
+        idx = w.proxy.index(0, 0)
+        w.dev_panel.tree.setCurrentIndex(idx)
+        before = w.tree_model.data(w.proxy.mapToSource(idx), Qt.CheckStateRole)
+        QTest.keyClick(w.dev_panel.tree.viewport(), Qt.Key_Space)
+        app.processEvents()
+        after = w.tree_model.data(w.proxy.mapToSource(idx), Qt.CheckStateRole)
+        self.assertNotEqual(before, after)
+
+    def test_reanalyze_preserves_selection_but_invalidates_review(self):
+        w = self.w
+        key = ("principal", "new.txt")
+        w.selection_ctrl.keys.add(key)
         w.ops_cache = ["gone"]
+        w._prepared_token = object()
+        w._authorized_token = w._prepared_token
         w.reanalyze()
-        self.assertEqual(w.selection_ctrl.keys, set())
+        self.assertEqual(w.selection_ctrl.keys, {key})
         self.assertEqual(w.ops_cache, [])
+        self.assertIsNone(w._prepared_token)
+        self.assertIsNone(w._authorized_token)
 
 
 if __name__ == "__main__":

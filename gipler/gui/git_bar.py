@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from gipler.gui import icons
+from gipler.gui.styles import make_context_label
 from gipler.gui.ssh_support import configure_askpass
 
 from gipler.git_integration import (
@@ -91,6 +92,7 @@ class GitProcessController(QProcess):
         self._timed_out = False
         self._timeout = DEFAULT_TIMEOUT
         self._pending_status = None
+        self._pending_commit = None
         self._closing = False
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -137,6 +139,55 @@ class GitProcessController(QProcess):
     def push(self) -> None:
         self._start_operation("push", ["push"])
 
+    def commit_selected(
+        self,
+        message: str,
+        paths: list[str] | tuple[str, ...],
+        *,
+        include_staged_outside: bool = False,
+    ) -> None:
+        clean = (message or "").strip()
+        selected = tuple(paths or ())
+        if not clean:
+            self.operation_finished.emit(
+                GitOperationResult(
+                    kind="commit_selected",
+                    repository=self.repository,
+                    ok=False,
+                    message="El mensaje del commit no puede estar vacío.",
+                )
+            )
+            return
+        if not selected:
+            self.operation_finished.emit(
+                GitOperationResult(
+                    kind="commit_selected",
+                    repository=self.repository,
+                    ok=False,
+                    message="No hay archivos seleccionados para el commit.",
+                )
+            )
+            return
+        if self.busy:
+            self.operation_finished.emit(
+                GitOperationResult(
+                    kind="commit_selected",
+                    repository=self.repository,
+                    ok=False,
+                    message="Hay una operación Git en curso. Espere a que termine.",
+                )
+            )
+            return
+        self._pending_commit = (clean, selected, bool(include_staged_outside))
+        self._start(
+            "commit_check_unmerged",
+            ["ls-files", "-u", "-z"],
+            kind="commit_selected",
+            timeout=STATUS_TIMEOUT,
+            optional_locks=True,
+            no_prompt=True,
+        )
+
     def commit(self, message: str) -> None:
         clean = (message or "").strip()
         if not clean:
@@ -181,6 +232,7 @@ class GitProcessController(QProcess):
             self._message = ""
             self._timed_out = False
             self._pending_status = None
+            self._pending_commit = None
 
     def _start_operation(self, kind: str, args: list[str]) -> None:
         if self.busy:
@@ -239,6 +291,13 @@ class GitProcessController(QProcess):
             self._pending_status = None
             self.status_ready.emit(None)
         else:
+            if purpose in (
+                "stage",
+                "commit_check_unmerged",
+                "commit_recheck_unmerged",
+            ):
+                kind = "commit_selected"
+                self._pending_commit = None
             self.operation_finished.emit(
                 GitOperationResult(
                     kind=kind or "git",
@@ -350,6 +409,125 @@ class GitProcessController(QProcess):
                 no_prompt=True,
             )
             return
+        if purpose == "commit_check_unmerged":
+            pending = self._pending_commit
+            if pending is None:
+                return
+            _message, paths, _include_staged_outside = pending
+            if exit_code != 0:
+                self._pending_commit = None
+                self.operation_finished.emit(
+                    GitOperationResult(
+                        kind="commit_selected",
+                        repository=self.repository,
+                        ok=False,
+                        message=friendly_error(
+                            "commit_selected", stderr, stdout, exit_code
+                        ),
+                        stdout=stdout,
+                        stderr=stderr,
+                        returncode=exit_code,
+                    )
+                )
+                return
+            if stdout.replace("\0", "").strip():
+                self._pending_commit = None
+                self.operation_finished.emit(
+                    GitOperationResult(
+                        kind="commit_selected",
+                        repository=self.repository,
+                        ok=False,
+                        message=(
+                            "Commit bloqueado: hay conflictos sin resolver. "
+                            "Resuelva los conflictos y prepare los archivos "
+                            "explícitamente antes de confirmar."
+                        ),
+                    )
+                )
+                return
+            self._start(
+                "stage",
+                ["--literal-pathspecs", "add", "--", *paths],
+                kind="commit_selected",
+                timeout=DEFAULT_TIMEOUT,
+                no_prompt=True,
+            )
+            return
+        if purpose == "stage":
+            pending = self._pending_commit
+            if pending is None:
+                return
+            message, paths, include_staged_outside = pending
+            if exit_code != 0:
+                self._pending_commit = None
+                self.operation_finished.emit(
+                    GitOperationResult(
+                        kind="commit_selected",
+                        repository=self.repository,
+                        ok=False,
+                        message=friendly_error("stage", stderr, stdout, exit_code),
+                        stdout=stdout,
+                        stderr=stderr,
+                        returncode=exit_code,
+                    )
+                )
+                return
+            self._start(
+                "commit_recheck_unmerged",
+                ["ls-files", "-u", "-z"],
+                kind="commit_selected",
+                timeout=STATUS_TIMEOUT,
+                optional_locks=True,
+                no_prompt=True,
+            )
+            return
+        if purpose == "commit_recheck_unmerged":
+            pending = self._pending_commit
+            if pending is None:
+                return
+            message, paths, include_staged_outside = pending
+            if exit_code != 0:
+                self._pending_commit = None
+                self.operation_finished.emit(
+                    GitOperationResult(
+                        kind="commit_selected",
+                        repository=self.repository,
+                        ok=False,
+                        message=friendly_error(
+                            "commit_selected", stderr, stdout, exit_code
+                        ),
+                        stdout=stdout,
+                        stderr=stderr,
+                        returncode=exit_code,
+                    )
+                )
+                return
+            if stdout.replace("\0", "").strip():
+                self._pending_commit = None
+                self.operation_finished.emit(
+                    GitOperationResult(
+                        kind="commit_selected",
+                        repository=self.repository,
+                        ok=False,
+                        message=(
+                            "Commit bloqueado: aparecieron conflictos sin "
+                            "resolver. No se confirmó ningún archivo."
+                        ),
+                    )
+                )
+                return
+            self._pending_commit = None
+            args = ["--literal-pathspecs", "commit", "-m", message]
+            if not include_staged_outside:
+                args.extend(["--", *paths])
+            self._start(
+                "operation",
+                args,
+                kind="commit_selected",
+                timeout=DEFAULT_TIMEOUT,
+                no_prompt=True,
+            )
+            return
         if purpose == "operation":
             ok = exit_code == 0
             text = (
@@ -357,6 +535,7 @@ class GitProcessController(QProcess):
                     "fetch": "Fetch completado.",
                     "pull": "Pull completado.",
                     "commit": "Commit creado.",
+                    "commit_selected": "Commit creado.",
                     "push": "Push completado.",
                 }.get(kind, "Operación completada.")
                 if ok
@@ -395,6 +574,13 @@ class GitProcessController(QProcess):
             self._pending_status = None
             self.status_ready.emit(None)
         else:
+            if purpose in (
+                "stage",
+                "commit_check_unmerged",
+                "commit_recheck_unmerged",
+            ):
+                kind = "commit_selected"
+                self._pending_commit = None
             self.operation_finished.emit(
                 GitOperationResult(
                     kind=kind or "git",
@@ -429,13 +615,17 @@ class GitBar(QWidget):
     repository_changed = Signal(str)
     status_changed = Signal(object)
 
-    def __init__(self, repository: str, parent=None):
+    def __init__(self, repository: str, parent=None, context_label=None):
         super().__init__(parent)
         self.repository = os.path.abspath(os.path.expanduser(repository)) if repository else ""
         self._status = None
         self._available = False
         self._status_checked = False
         self._active = False
+        self._owns_context = context_label is None
+        self.context_label = context_label or make_context_label("Git · No disponible")
+        self._context_text = self.context_label.text()
+        self._context_tooltip = ""
         self.controller = GitProcessController(self.repository, self)
         self.controller.status_ready.connect(self._on_status)
         self.controller.operation_finished.connect(self._on_operation_finished)
@@ -453,7 +643,7 @@ class GitBar(QWidget):
 
     # -- construction --------------------------------------------------
     def _build_ui(self) -> None:
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(2)
@@ -461,10 +651,6 @@ class GitBar(QWidget):
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
-        self.status_label = ElidedLabel("Git")
-        self.status_label.setTextFormat(Qt.PlainText)
-        self.status_label.setAccessibleName("Estado Git de la referencia")
-        row.addWidget(self.status_label, 1)
 
         self.fetch_button = self._action_button(
             "fetch",
@@ -499,23 +685,21 @@ class GitBar(QWidget):
         self._base_tooltips = {
             button: button.toolTip() for button in self.action_buttons
         }
+        if self._owns_context:
+            row.addWidget(self.context_label)
         row.addWidget(self.fetch_button)
         row.addWidget(self.pull_button)
-        separator = QWidget()
-        separator.setFixedWidth(1)
-        separator.setFixedHeight(18)
-        separator.setBackgroundRole(QPalette.ColorRole.Mid)
-        separator.setAutoFillBackground(True)
-        row.addWidget(separator)
-        row.addWidget(self.commit_button)
         row.addWidget(self.push_button)
-        outer.addLayout(row)
+        row.addWidget(self.commit_button)
+        self._toolbar_row = row
 
         self.commit_row = QWidget(self)
+        self.commit_row.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         commit_layout = QHBoxLayout(self.commit_row)
         commit_layout.setContentsMargins(0, 0, 0, 0)
         commit_layout.setSpacing(2)
         self.commit_edit = QLineEdit()
+        self.commit_edit.setFixedWidth(180)
         self.commit_edit.setPlaceholderText("Mensaje del commit...")
         self.commit_edit.setAccessibleName("Mensaje del commit")
         self.commit_edit.returnPressed.connect(self._confirm_commit)
@@ -533,7 +717,7 @@ class GitBar(QWidget):
         commit_layout.addWidget(self.commit_edit, 1)
         commit_layout.addWidget(self.commit_accept)
         commit_layout.addWidget(self.commit_cancel)
-        outer.addWidget(self.commit_row)
+        outer.addLayout(row)
         self.commit_row.setVisible(False)
 
         self.commit_error = ElidedLabel()
@@ -675,6 +859,7 @@ class GitBar(QWidget):
         self._status_checked = True
         self._available = status is not None
         if status is None:
+            self._set_context("Git · No disponible")
             self.setVisible(False)
             self.collapse_commit()
             self._update_controls()
@@ -685,7 +870,7 @@ class GitBar(QWidget):
             self.setVisible(self.isEnabled())
             self._update_controls()
             return
-        self.status_label.setText(status.summary, self._status_tooltip(status))
+        self._show_repository_status(status)
         self.setVisible(self.isEnabled())
         self.status_changed.emit(status)
         self._update_controls()
@@ -704,6 +889,22 @@ class GitBar(QWidget):
             f"Sin seguimiento: {status.untracked} · Conflictos: {status.unmerged}"
         )
 
+    def _show_repository_status(self, status) -> None:
+        self._set_context(status.summary, self._status_tooltip(status))
+
+    def _set_context(self, text: str, tooltip: str | None = None) -> None:
+        self._context_text = str(text or "")
+        self._context_tooltip = (
+            self._context_text if tooltip is None else tooltip
+        )
+        if self._owns_context or self._active:
+            self.context_label.setText(self._context_text)
+            self.context_label.setToolTip(self._context_tooltip)
+
+    def refresh_context(self) -> None:
+        """Aplica el texto almacenado al bloque contextual compartido."""
+        self._set_context(self._context_text, self._context_tooltip)
+
     def _on_busy(self, busy: bool) -> None:
         if busy:
             self._refresh_timer.stop()
@@ -711,11 +912,9 @@ class GitBar(QWidget):
             self._refresh_timer.start()
         if not busy:
             if self._status is not None:
-                self.status_label.setText(
-                    self._status.summary, self._status_tooltip(self._status)
-                )
+                self._show_repository_status(self._status)
             else:
-                self.status_label.setText("Git")
+                self._set_context("Git · No disponible")
         self._update_controls()
         if busy and self.controller.operation_in_progress:
             tooltip = (
@@ -723,7 +922,7 @@ class GitBar(QWidget):
                 if self._status is not None
                 else "Operación Git en curso."
             )
-            self.status_label.setText("Git: operación en curso…", tooltip)
+            self._set_context("Operación en curso…", tooltip)
 
     def _set_tooltip(self, button: QToolButton, reason: str = "") -> None:
         text = self._base_tooltips[button]
@@ -882,12 +1081,19 @@ class GitBar(QWidget):
             self._show_commit_error(reason)
             return
         self.commit_error.setVisible(False)
+        self.commit_button.setVisible(False)
+        self._toolbar_row.insertWidget(
+            self._toolbar_row.indexOf(self.commit_button) + 1,
+            self.commit_row,
+        )
         self.commit_row.setVisible(True)
         self.commit_edit.setFocus()
 
     def collapse_commit(self) -> None:
         self.commit_error.setVisible(False)
         self.commit_row.setVisible(False)
+        self._toolbar_row.removeWidget(self.commit_row)
+        self.commit_button.setVisible(True)
 
     def cancel_commit(self) -> None:
         self.collapse_commit()
@@ -922,11 +1128,12 @@ class GitBar(QWidget):
             self.commit_error.setVisible(False)
 
     def _on_operation_finished(self, result: GitOperationResult) -> None:
+        if result.kind == "commit_selected":
+            return
         if result.kind == "commit":
             if result.ok:
-                self.commit_error.setVisible(False)
-                self.commit_row.setVisible(False)
                 self.commit_edit.clear()
+                self.collapse_commit()
                 self.message.emit(result.message)
                 if result.refresh_comparison:
                     self.repository_changed.emit(self.repository)

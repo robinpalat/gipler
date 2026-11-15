@@ -21,6 +21,8 @@ class Row:
         git_stage: str = "",
         perm: str = "",
         selection_key: tuple[str, str] | None = None,
+        copy_blockers: tuple[str, ...] = (),
+        copy_status: str = "",
     ):
         self.path = path
         self.owner = owner or "sin determinar"
@@ -34,6 +36,8 @@ class Row:
         self.git_stage = git_stage    # staged | unstaged | staged+unstaged
         self.perm = perm              # permisos Dev→repo, vacío si coinciden
         self.selection_key = selection_key
+        self.copy_blockers = tuple(copy_blockers)
+        self.copy_status = copy_status
 
     @property
     def asterisk(self) -> bool:
@@ -59,6 +63,10 @@ class Row:
             s += f" permisos_dev_repo={self.perm}"
         if self.incidences:
             s += f" incidencias={','.join(self.incidences)}"
+        if self.copy_blockers:
+            from gipler.copy_policy import describe_blockers
+
+            s += "\n    copia=" + "; ".join(describe_blockers(self.copy_blockers))
         for x in self.extra:
             s += f"\n    {x}"
         return s
@@ -96,6 +104,16 @@ def state_detail(row) -> str:
     return " · ".join(parts)
 
 
+def warnings_text(row) -> str:
+    """Motivos visibles en la columna de advertencias."""
+    blockers = getattr(row, "copy_blockers", ())
+    if blockers:
+        from gipler.copy_policy import describe_blockers
+
+        return "; ".join(describe_blockers(blockers))
+    return ",".join(row.incidences)
+
+
 def tooltip_text(row) -> str:
     """Detalle completo para tooltips (GUI y TUI)."""
     m = markers(row)
@@ -107,70 +125,12 @@ def tooltip_text(row) -> str:
         out += f"\nDetalle: {d}"
     if row.incidences:
         out += f"\nIncidencias: {','.join(row.incidences)}"
+    blockers = getattr(row, "copy_blockers", ())
+    if blockers:
+        from gipler.copy_policy import describe_blockers
+
+        out += "\nCopia: " + "; ".join(describe_blockers(blockers))
     return out
-
-
-def _counted(rows, pred) -> list[Row]:
-    return [r for r in rows if pred(r)]
-
-
-def render(meta: dict, rows: list[Row], warnings: list[str]) -> str:
-    out: list[str] = []
-    out.append("# Gipler — informe de análisis (solo lectura, sin copias)")
-    out.append(f"Dev: {meta.get('dev', '')}")
-    out.append(f"Principal: {meta.get('principal', '')}")
-    out.append(f"Addons: {meta.get('addons', '')}")
-    for w in warnings:
-        out.append(f"AVISO: {w}")
-    n = len(rows)
-    out.append(f"Total filas: {n}")
-    out.append("")
-
-    def section(title: str, filtered: list[Row]) -> None:
-        out.append(f"## {title} ({len(filtered)})")
-        for r in filtered:
-            out.append(r.line())
-        out.append("")
-
-    by_repo = lambda d: [r for r in rows if r.destination == d]
-    section("1. Repositorio principal", by_repo("principal"))
-    section("2. Repositorio de addons", by_repo("addons"))
-    section("3. Archivos nuevos (new_in_dev)", _counted(rows, lambda r: r.axis_a == "new_in_dev"))
-    section("4. Archivos modificados (modified_in_dev)", _counted(rows, lambda r: r.axis_a == "modified_in_dev"))
-    section("4b. No comparables (not_comparable)", _counted(rows, lambda r: r.axis_a == "not_comparable"))
-    section("4c. Diferencia de permisos Dev→repo (⌀)", _counted(rows, lambda r: bool(r.perm)))
-    section("5. Archivos idénticos (identical)", _counted(rows, lambda r: r.axis_a == "identical"))
-    section("6. Modificaciones locales (tracked_modified)", _counted(rows, lambda r: r.axis_b == "tracked_modified"))
-    section("7. Ignorados (ignored)", _counted(rows, lambda r: r.axis_b == "ignored"))
-    section("8. Huérfanos (missing_in_dev / manifest_undeclared_file)", _counted(
-        rows,
-        lambda r: r.axis_a == "missing_in_dev" or "manifest_undeclared_file" in r.incidences,
-    ))
-    ambiguous = _counted(
-        rows,
-        lambda r: (
-            r.destination in ("", "sin determinar")
-            or "shared_file" in r.incidences
-            or "status_unrecognized" in r.incidences
-            or "status_development" in r.incidences
-            or "unknown_owner" in r.incidences
-            or "external_dependency" in r.incidences
-            or "path_outside_prefix" in r.incidences
-            or "symlink_escapes_allowed_dirs" in r.incidences
-            or "manifest_missing_file" in r.incidences
-            or "manifest_vs_git_discrepancy" in r.incidences
-            or "duplicate_tracked_in_both" in r.incidences
-            or "present_in_both_repos" in r.incidences
-        ),
-    )
-    section("9. Ambigüedades e incidencias", ambiguous)
-    sin_destino = [r for r in rows if r.destination in ("", "sin determinar")]
-    if sin_destino:
-        out.append(f"## 10. Sin destino (sin determinar) ({len(sin_destino)})")
-        for r in sin_destino:
-            out.append(r.line())
-        out.append("")
-    return "\n".join(out) + "\n"
 
 
 def render_profile(

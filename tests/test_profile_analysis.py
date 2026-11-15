@@ -97,10 +97,8 @@ class ProfileAnalysisTests(unittest.TestCase):
         result = analyze_profile(self.profile)
         by_path = {entry.path: entry for entry in result.entries}
         self.assertIsNone(by_path["known.txt"].eligible_destination_source_id)
-        self.assertEqual(
-            by_path["shared.txt"].eligible_destination_source_id,
-            "src_a0000001",
-        )
+        self.assertIsNone(by_path["shared.txt"].eligible_destination_source_id)
+        self.assertIn("shared_file", by_path["shared.txt"].copy_blockers)
         self.assertIsNone(by_path["unclassified.txt"].eligible_destination_source_id)
         self.assertIsNone(by_path["ambiguous.txt"].eligible_destination_source_id)
 

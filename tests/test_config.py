@@ -1,33 +1,26 @@
-import os
-import tempfile
+"""Tests de configuración de usuario (tema y preferencias de visualización)."""
 import unittest
 
-from gipler.config import configured_paths, default_paths, get_settings, save_paths
+from gipler.config import get_settings
 
 
 class ConfigurationTests(unittest.TestCase):
-    def test_default_paths_are_independent_of_install_location(self):
-        paths = default_paths()
-        self.assertEqual(len(paths), 3)
-        self.assertTrue(all(os.path.isabs(path) for path in paths))
-        self.assertNotIn("Idiomind", os.path.commonpath(paths))
-
-    def test_configured_paths_round_trip(self):
+    def test_get_settings_returns_application_settings(self):
         settings = get_settings()
-        keys = ("paths/dev", "paths/principal", "paths/addons")
-        previous = [settings.value(key) for key in keys]
-        with tempfile.TemporaryDirectory() as root:
-            paths = tuple(os.path.join(root, name) for name in ("source", "main", "addons"))
-            try:
-                save_paths(*paths)
-                self.assertEqual(configured_paths(), paths)
-            finally:
-                for key, value in zip(keys, previous):
-                    if value is None:
-                        settings.remove(key)
-                    else:
-                        settings.setValue(key, value)
-                settings.sync()
+        self.assertEqual(settings.organizationName(), "Gipler")
+        self.assertEqual(settings.applicationName(), "Gipler")
+
+    def test_theme_preference_round_trip(self):
+        from gipler.gui import theme as th
+
+        previous = th.load_preference()
+        try:
+            th.save_preference("claro")
+            self.assertEqual(th.load_preference(), "claro")
+            th.save_preference("oscuro")
+            self.assertEqual(th.load_preference(), "oscuro")
+        finally:
+            th.save_preference(previous)
 
 
 if __name__ == "__main__":

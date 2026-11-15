@@ -21,6 +21,7 @@ from .helpers import commit_all, git, make_repo, write
 from gipler.git_integration import (
     GitError,
     GitOperationResult,
+    GitStatus,
     detect_repository,
     friendly_error,
     git_status,
@@ -31,7 +32,6 @@ from gipler.git_integration import (
 )
 from gipler.gui.git_bar import GitBar
 from gipler.gui.main_window import GiplerWindow
-from gipler.gui.profile_window import ProfileComparisonPage, ProfileWindow
 from gipler.profile import Source, create_profile, load_profile, save_profile
 
 APP = QApplication.instance() or QApplication([])
@@ -488,13 +488,35 @@ class GitBarTests(unittest.TestCase):
         self.addCleanup(bar.close)
         bar.activate()
         self.assertTrue(_wait_until(lambda: bar.available))
-        self.assertIn("limpio", bar.status_label.text())
+        self.assertEqual(bar.context_label.text(), bar.status.summary)
+        self.assertIn("limpio", bar.context_label.text())
         write(os.path.join(repo, "file.txt"), "v2\n")
         bar.refresh_status()
         self.assertTrue(
             _wait_until(lambda: bar.status is not None and bar.status.modified == 1)
         )
-        self.assertIn("modificado", bar.status_label.text())
+        self.assertEqual(bar.context_label.text(), bar.status.summary)
+        self.assertIn("modificado", bar.context_label.text())
+
+    def test_git_status_branch_and_remote_state_are_separate_and_exact(self):
+        ahead_behind = GitStatus(
+            repository="/tmp/repo",
+            branch="feature",
+            upstream="origin/feature",
+            ahead=2,
+            behind=3,
+        )
+        self.assertEqual(ahead_behind.branch_name, "feature")
+        self.assertEqual(ahead_behind.state_summary, "limpio · ↑2 ↓3")
+        self.assertEqual(ahead_behind.summary, "feature · limpio · ↑2 ↓3")
+
+        unknown_tracking = GitStatus(
+            repository="/tmp/repo",
+            branch="feature",
+            upstream="origin/feature",
+        )
+        self.assertEqual(unknown_tracking.state_summary, "limpio")
+        self.assertNotIn("al día", unknown_tracking.state_summary)
 
     def test_commit_inline_validation_and_message_preservation(self):
         repo = make_repo(self.tmp.name, "repo")
@@ -802,6 +824,179 @@ class GitBarTests(unittest.TestCase):
         bar.controller.shutdown()
 
 
+class GitCommitIntegrityTests(unittest.TestCase):
+    """AUD-018/AUD-019: unmerged y pathspecs literales."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _conflicted_repo(self) -> str:
+        repo = make_repo(self.tmp.name, "repo")
+        write(os.path.join(repo, "conflict.txt"), "base\n")
+        commit_all(repo)
+        main = _branch(repo)
+        git(repo, "checkout", "-qb", "feature")
+        write(os.path.join(repo, "conflict.txt"), "feature\n")
+        commit_all(repo, "feature")
+        git(repo, "checkout", "-q", main)
+        write(os.path.join(repo, "conflict.txt"), "main\n")
+        commit_all(repo, "main")
+        merge = subprocess.run(
+            ["git", "-C", repo, "merge", "feature"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(merge.returncode, 0)
+        return repo
+
+    def _bar(self, repo: str) -> GitBar:
+        bar = GitBar(repo)
+        self.addCleanup(bar.close)
+        return bar
+
+    def _run_selected(self, bar, paths, *, include=False, message="commit"):
+        results = []
+        bar.controller.operation_finished.connect(results.append)
+        bar.controller.commit_selected(
+            message, list(paths), include_staged_outside=include
+        )
+        self.assertTrue(_wait_until(lambda: bool(results)))
+        return results[0]
+
+    @staticmethod
+    def _head_files(repo: str) -> set[str]:
+        result = subprocess.run(
+            ["git", "-C", repo, "show", "--name-only", "--pretty=format:", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return {line for line in result.stdout.splitlines() if line}
+
+    @staticmethod
+    def _untracked(repo: str) -> set[str]:
+        result = subprocess.run(
+            ["git", "-C", repo, "ls-files", "--others", "--exclude-standard"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return {line for line in result.stdout.splitlines() if line}
+
+    def test_selected_commit_is_rejected_without_staging_conflicts(self):
+        repo = self._conflicted_repo()
+        bar = self._bar(repo)
+        head_before = self._head_files(repo)
+        file_before = open(
+            os.path.join(repo, "conflict.txt"), encoding="utf-8"
+        ).read()
+
+        result = self._run_selected(bar, ["conflict.txt"])
+
+        self.assertFalse(result.ok)
+        self.assertIn("conflictos", result.message)
+        self.assertEqual(self._head_files(repo), head_before)
+        unmerged = subprocess.run(
+            ["git", "-C", repo, "ls-files", "-u", "-z"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertIn("conflict.txt", unmerged)
+        self.assertEqual(
+            open(os.path.join(repo, "conflict.txt"), encoding="utf-8").read(),
+            file_before,
+        )
+
+    def test_normal_commit_remains_blocked_with_unmerged_entries(self):
+        repo = self._conflicted_repo()
+        bar = self._bar(repo)
+        bar.activate()
+        self.assertTrue(
+            _wait_until(
+                lambda: bar.status is not None and bar.status.unmerged == 1
+            )
+        )
+        self.assertFalse(bar.commit_button.isEnabled())
+        self.assertFalse(bar._can_commit())
+        bar.begin_commit()
+        self.assertIn("conflictos", bar.commit_error.text())
+
+    def test_literal_pathspecs_do_not_stage_lookalike_files(self):
+        repo = make_repo(self.tmp.name, "repo")
+        write(os.path.join(repo, "base.txt"), "base\n")
+        commit_all(repo)
+        selected = [
+            "star*name.txt",
+            "q?mark.txt",
+            "br[ack]et.txt",
+            ":colon.txt",
+        ]
+        lookalikes = [
+            "starXname.txt",
+            "qZmark.txt",
+            "bracket.txt",
+            "colon.txt",
+        ]
+        for name in selected + lookalikes:
+            write(os.path.join(repo, name), f"{name}\n")
+        bar = self._bar(repo)
+
+        result = self._run_selected(bar, selected)
+
+        self.assertTrue(result.ok, result.message)
+        committed = self._head_files(repo)
+        for name in selected:
+            self.assertIn(name, committed)
+        for name in lookalikes:
+            self.assertNotIn(name, committed)
+        self.assertEqual(self._untracked(repo), set(lookalikes))
+
+    def test_missing_selected_file_does_not_stage_matching_file(self):
+        repo = make_repo(self.tmp.name, "repo")
+        write(os.path.join(repo, "base.txt"), "base\n")
+        commit_all(repo)
+        write(os.path.join(repo, "a*.txt"), "selected\n")
+        write(os.path.join(repo, "a1.txt"), "unselected\n")
+        os.unlink(os.path.join(repo, "a*.txt"))
+        bar = self._bar(repo)
+
+        result = self._run_selected(bar, ["a*.txt"])
+
+        self.assertFalse(result.ok)
+        self.assertIn("a1.txt", self._untracked(repo))
+        self.assertNotIn("a1.txt", self._head_files(repo))
+        staged = subprocess.run(
+            ["git", "-C", repo, "diff", "--cached", "--name-only", "-z"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertNotIn("a1.txt", staged)
+
+    def test_include_staged_outside_keeps_its_semantics(self):
+        repo = make_repo(self.tmp.name, "repo")
+        write(os.path.join(repo, "base.txt"), "base\n")
+        commit_all(repo)
+        write(os.path.join(repo, "outside.txt"), "outside\n")
+        git(repo, "add", "outside.txt")
+        write(os.path.join(repo, "selected*name.txt"), "selected\n")
+        write(os.path.join(repo, "selectedXname.txt"), "lookalike\n")
+        bar = self._bar(repo)
+
+        result = self._run_selected(
+            bar, ["selected*name.txt"], include=True
+        )
+
+        self.assertTrue(result.ok, result.message)
+        committed = self._head_files(repo)
+        self.assertIn("outside.txt", committed)
+        self.assertIn("selected*name.txt", committed)
+        self.assertNotIn("selectedXname.txt", committed)
+        self.assertIn("selectedXname.txt", self._untracked(repo))
+
+
 class GitWindowIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -827,7 +1022,7 @@ class GitWindowIntegrationTests(unittest.TestCase):
         else:
             os.environ["HOME"] = self.old_home
 
-    def test_main_window_shows_bar_only_on_reference_page(self):
+    def test_main_window_shows_bar_only_in_git_view(self):
         window = GiplerWindow(profile=load_profile(self.profile.id))
         self.addCleanup(window.close)
         window.show()
@@ -835,41 +1030,53 @@ class GitWindowIntegrationTests(unittest.TestCase):
         self.assertFalse(window.git_bar_stack.isVisible())
         window._on_repo("src_repo")
         bar = window.git_bars["src_repo"]
-        self.assertTrue(_wait_until(lambda: window.git_bar_stack.isVisible()))
-        self.assertTrue(bar.available)
+        self.assertFalse(window.git_bar_stack.isVisible())
+        self.assertFalse(bar.isVisible())
         self.assertEqual(bar.repository, os.path.realpath(self.repo))
-        self.assertIs(window.git_bar_stack.parent(), window.dest_panel)
+        self.assertIs(window.git_bar_stack.parent(), window.filter_bar)
         self.assertGreaterEqual(
-            window.dest_panel.header.indexOf(window.git_bar_stack), 0
+            window.filter_bar.layout().indexOf(window.git_bar_stack), 0
         )
         self.assertIs(bar.parent(), window.git_bar_stack)
         self.assertEqual(window.dest_panel.title_label.full_text(), "repo")
         self.assertTrue(window.dest_panel.folder_icon.isVisible())
+        window.axis_a_box.setCurrentIndex(
+            window.axis_a_box.findData("git")
+        )
+        self.assertTrue(
+            _wait_until(lambda: window.git_bar_stack.isVisible())
+        )
+        self.assertTrue(_wait_until(lambda: bar.available))
+        self.assertTrue(bar.isVisible())
         window._show_inicio()
         APP.processEvents()
         self.assertFalse(window.git_bar_stack.isVisible())
         self.assertFalse(bar._active)
 
-    def test_commit_expands_in_reference_header_without_tree_rebuild(self):
-        write(os.path.join(self.repo, "file.txt"), "staged\n")
-        git(self.repo, "add", "file.txt")
+    def test_commit_expands_in_git_view_without_tree_rebuild(self):
+        write(os.path.join(self.repo, "file.txt"), "unstaged\n")
         window = GiplerWindow(profile=load_profile(self.profile.id))
         self.addCleanup(window.close)
         window.show()
         window._on_repo("src_repo")
-        bar = window.git_bars["src_repo"]
-        self.assertTrue(_wait_until(lambda: bar.available))
-        model = window.tree_model
+        window.axis_a_box.setCurrentIndex(
+            window.axis_a_box.findData("git")
+        )
+        self.assertTrue(
+            _wait_until(lambda: window.git_bars["src_repo"].available)
+        )
+        model = window.git_tree_model
         row_count = model.rowCount()
-        self.assertTrue(bar.commit_button.isEnabled())
-        bar.begin_commit()
-        self.assertTrue(bar.commit_expanded)
-        self.assertIs(window.tree_model, model)
-        self.assertEqual(window.tree_model.rowCount(), row_count)
-        bar.cancel_commit()
-        self.assertFalse(bar.commit_expanded)
+        window.git_tree_model.add_commit_paths({"file.txt"})
+        window._update_commit_ui()
+        window._on_commit_requested()
+        self.assertTrue(window.dest_panel.commit_message_row.isVisible())
+        self.assertIs(window.git_tree_model, model)
+        self.assertEqual(window.git_tree_model.rowCount(), row_count)
+        window._on_commit_cancelled()
+        self.assertFalse(window.dest_panel.commit_message_row.isVisible())
 
-    def test_profile_tabs_have_independent_bars(self):
+    def test_profile_has_independent_git_bars(self):
         second = make_repo(self.tmp.name, "second")
         write(os.path.join(second, "other.txt"), "other\n")
         commit_all(second)
@@ -877,38 +1084,68 @@ class GitWindowIntegrationTests(unittest.TestCase):
             Source(id="src_second", name="Second", root=second, order=1)
         )
         save_profile(self.profile)
-        window = ProfileWindow(load_profile(self.profile.id))
+        window = GiplerWindow(profile=load_profile(self.profile.id))
         self.addCleanup(window.close)
         window.show()
         APP.processEvents()
-        first_page = window.tabs.widget(1)
-        second_page = window.tabs.widget(2)
-        self.assertIsInstance(first_page, ProfileComparisonPage)
-        self.assertIsInstance(second_page, ProfileComparisonPage)
-        window.tabs.setCurrentIndex(1)
-        self.assertTrue(_wait_until(lambda: first_page.git_bar.available))
-        self.assertTrue(first_page.git_bar._active)
-        self.assertIs(first_page.git_bar.parent(), first_page.reference_panel)
-        self.assertGreaterEqual(
-            first_page.reference_panel.header.indexOf(first_page.git_bar), 0
-        )
-        self.assertEqual(first_page.layout().indexOf(first_page.git_bar), -1)
-        self.assertTrue(first_page.reference_panel.folder_icon.isVisible())
-        self.assertEqual(
-            first_page.reference_panel.title_label.full_text(),
-            os.path.basename(os.path.normpath(self.repo)),
-        )
-        window.tabs.setCurrentIndex(2)
-        self.assertTrue(_wait_until(lambda: second_page.git_bar.available))
-        self.assertFalse(first_page.git_bar._active)
-        self.assertTrue(second_page.git_bar._active)
-        self.assertNotEqual(
-            first_page.git_bar.repository, second_page.git_bar.repository
-        )
-        window.tabs.setCurrentIndex(window.tabs.count() - 2)
+        self.assertIn("src_repo", window.git_bars)
+        self.assertIn("src_second", window.git_bars)
+        first_bar = window.git_bars["src_repo"]
+        second_bar = window.git_bars["src_second"]
+        self.assertNotEqual(first_bar.repository, second_bar.repository)
+        window._show_compare("src_repo")
+        window.axis_a_box.setCurrentText("Git")
         APP.processEvents()
-        self.assertFalse(first_page.git_bar._active)
-        self.assertFalse(second_page.git_bar._active)
+        self.assertTrue(_wait_until(lambda: first_bar._active))
+        self.assertFalse(second_bar._active)
+        window._on_repo(button="src_second")
+        self.assertTrue(_wait_until(lambda: second_bar._active))
+        self.assertFalse(first_bar._active)
+        window._show_inicio()
+        APP.processEvents()
+        self.assertFalse(first_bar._active)
+        self.assertFalse(second_bar._active)
+
+    def test_conflict_after_git_view_prunes_selection_and_blocks_commit(self):
+        write(os.path.join(self.repo, "file.txt"), "unstaged\n")
+        window = GiplerWindow(profile=load_profile(self.profile.id))
+        self.addCleanup(window.close)
+        window.show()
+        window._on_repo("src_repo")
+        window.axis_a_box.setCurrentIndex(
+            window.axis_a_box.findData("git")
+        )
+        bar = window.git_bars["src_repo"]
+        self.assertTrue(_wait_until(lambda: bar.available))
+        self.assertTrue(_wait_until(lambda: window.git_tree_model is not None))
+        window.git_tree_model.add_commit_paths({"file.txt"})
+        self.assertIn("file.txt", window.git_tree_model.commit_selected)
+
+        main = _branch(self.repo)
+        commit_all(self.repo, "main change")
+        git(self.repo, "checkout", "-qb", "feature")
+        write(os.path.join(self.repo, "file.txt"), "feature\n")
+        commit_all(self.repo, "feature change")
+        git(self.repo, "checkout", "-q", main)
+        write(os.path.join(self.repo, "file.txt"), "main change\n")
+        commit_all(self.repo, "main second change")
+        merge = subprocess.run(
+            ["git", "-C", self.repo, "merge", "feature"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(merge.returncode, 0)
+
+        bar.refresh_status()
+        self.assertTrue(
+            _wait_until(
+                lambda: bar.status is not None and bar.status.unmerged == 1
+            )
+        )
+        APP.processEvents()
+        self.assertNotIn("file.txt", window.git_tree_model.commit_selected)
+        self.assertFalse(window.dest_panel.commit_button.isEnabled())
+        self.assertIn("conflictos", window.dest_panel.commit_warning.text())
 
 
 if __name__ == "__main__":

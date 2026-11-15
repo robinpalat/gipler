@@ -26,6 +26,7 @@ import tomllib
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 
 SCHEMA = 1
 
@@ -51,6 +52,20 @@ _KEY_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 class ProfileError(ValueError):
     """Entrada inválida o fichero de perfil ilegible."""
+
+
+class BaselineStatus(str, Enum):
+    """Estado histórico de una ruta respecto de las líneas de base.
+
+    Es independiente de la pertenencia y de la comparación física actual:
+    describe únicamente qué antecedente histórico existe y si su contenido
+    coincide con el archivo presente en el árbol de trabajo.
+    """
+
+    NEW = "new"
+    KNOWN = "known"
+    KNOWN_SAME = "known_same"
+    KNOWN_MODIFIED = "known_modified"
 
 
 # --------------------------------------------------------------- rutas
@@ -126,12 +141,47 @@ class BaselineEntry:
 
 
 @dataclass(frozen=True)
+class ReferenceRoot:
+    """Raíz ajena que se capturará como snapshot etiquetado.
+
+    La ruta absoluta es metadato de procedencia; la identidad la forman la
+    fuente y el rol, junto con la ruta relativa de cada entrada.
+    """
+
+    root: str
+    source_id: str = ""
+    role: str = "other"
+
+
+@dataclass(frozen=True)
+class BaselineSnapshot:
+    """Captura histórica de una raíz ajena, sin colapsar rutas relativas."""
+
+    source_id: str
+    role: str
+    root: str
+    entries: tuple[BaselineEntry, ...] = ()
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "source_id": self.source_id,
+            "role": self.role,
+            "root": self.root,
+            "entries": [entry.as_dict() for entry in self.entries],
+        }
+
+
+@dataclass(frozen=True)
 class SourceBaseline:
     established_at: str
     work_entries: tuple[BaselineEntry, ...]
     reference_entries: tuple[BaselineEntry, ...]
     destination_entries: tuple[BaselineEntry, ...]
     other_reference_paths: tuple[str, ...] = ()
+    other_references: tuple[BaselineSnapshot, ...] = ()
+    work_root: str = ""
+    reference_root: str = ""
+    destination_root: str = ""
 
     @property
     def work_paths(self) -> frozenset[str]:
@@ -147,11 +197,10 @@ class SourceBaseline:
 
     @property
     def preexisting_reference_paths(self) -> frozenset[str]:
-        return (
-            self.reference_paths
-            | self.destination_paths
-            | frozenset(self.other_reference_paths)
-        )
+        other_paths = set(self.other_reference_paths)
+        for snapshot in self.other_references:
+            other_paths.update(entry.path for entry in snapshot.entries)
+        return self.reference_paths | self.destination_paths | frozenset(other_paths)
 
 
 @dataclass
@@ -268,10 +317,15 @@ def capture_source_baseline(
     work_dir: str,
     reference_dir: str,
     destination_dir: str | None = None,
-    other_reference_dirs: tuple[str, ...] = (),
+    other_reference_dirs: tuple[str | ReferenceRoot, ...] = (),
     established_at: str | None = None,
 ) -> SourceBaseline:
-    """Capture read-only identities in Dev and one reference directory."""
+    """Capture read-only identities in Dev and one reference directory.
+
+    ``other_reference_dirs`` accepts legacy bare paths and ``ReferenceRoot``
+    values. Bare paths keep the old, unlabeled behavior; ``ReferenceRoot``
+    captures preserve source, role and absolute root as provenance metadata.
+    """
     from .scanner import scan_tree
 
     work_root = os.path.abspath(os.path.expanduser(work_dir))
@@ -279,19 +333,31 @@ def capture_source_baseline(
     destination_root = os.path.abspath(
         os.path.expanduser(destination_dir or reference_dir)
     )
-    other_roots = tuple(
-        dict.fromkeys(
-            os.path.abspath(os.path.expanduser(path))
-            for path in other_reference_dirs
-            if os.path.isdir(os.path.expanduser(path))
-        )
-    )
     if not os.path.isdir(work_root):
         raise NotADirectoryError(work_root)
     if not os.path.isdir(reference_root):
         raise NotADirectoryError(reference_root)
     if not os.path.isdir(destination_root):
         raise NotADirectoryError(destination_root)
+
+    own_roots = {
+        os.path.normcase(work_root),
+        os.path.normcase(reference_root),
+        os.path.normcase(destination_root),
+    }
+    other_specs: list[ReferenceRoot] = []
+    seen_other: set[tuple[str, str, str]] = set()
+    for raw in other_reference_dirs:
+        spec = raw if isinstance(raw, ReferenceRoot) else ReferenceRoot(str(raw))
+        root = os.path.abspath(os.path.expanduser(spec.root))
+        if not os.path.isdir(root) or os.path.normcase(root) in own_roots:
+            continue
+        role = spec.role or "other"
+        key = (os.path.normcase(root), spec.source_id, role)
+        if key in seen_other:
+            continue
+        seen_other.add(key)
+        other_specs.append(ReferenceRoot(root, spec.source_id, role))
 
     def capture(root: str) -> tuple[BaselineEntry, ...]:
         content_entries = scan_tree(root, git=False)
@@ -336,16 +402,27 @@ def capture_source_baseline(
         if os.path.normcase(destination_root) == os.path.normcase(reference_root)
         else capture(destination_root)
     )
-    own_roots = {
-        os.path.normcase(work_root),
-        os.path.normcase(reference_root),
-        os.path.normcase(destination_root),
-    }
+    other_capture_cache: dict[str, tuple[BaselineEntry, ...]] = {}
+
+    def capture_other(root: str) -> tuple[BaselineEntry, ...]:
+        key = os.path.normcase(root)
+        if key not in other_capture_cache:
+            other_capture_cache[key] = capture(root)
+        return other_capture_cache[key]
+
+    other_references = tuple(
+        BaselineSnapshot(
+            source_id=spec.source_id,
+            role=spec.role,
+            root=spec.root,
+            entries=capture_other(spec.root),
+        )
+        for spec in other_specs
+    )
     other_paths = {
         entry.path
-        for root in other_roots
-        if os.path.normcase(root) not in own_roots
-        for entry in capture(root)
+        for snapshot in other_references
+        for entry in snapshot.entries
     }
     return SourceBaseline(
         established_at=established_at
@@ -354,6 +431,10 @@ def capture_source_baseline(
         reference_entries=reference_entries,
         destination_entries=destination_entries,
         other_reference_paths=tuple(sorted(other_paths)),
+        other_references=other_references,
+        work_root=work_root,
+        reference_root=reference_root,
+        destination_root=destination_root,
     )
 
 
@@ -374,12 +455,43 @@ def _validate_name(name: str, root: str | None, except_id: str | None = None) ->
 
 
 def _validate_work_dir(work_dir: str) -> str:
+    """Valida el directorio de trabajo y devuelve su ruta absoluta normalizada.
+
+    Diferencia entre perfil inválido (vacío/relativo), directorio inexistente
+    y falta de permisos. Nunca sustituye la ruta por el CWD del proceso.
+    """
     clean = (work_dir or "").strip()
     if not clean:
         raise ProfileError("el directorio de trabajo no puede estar vacío")
-    if not os.path.isabs(os.path.expanduser(clean)):
+    expanded = os.path.expanduser(clean)
+    if not os.path.isabs(expanded):
         raise ProfileError(f"el directorio de trabajo debe ser absoluto: {clean!r}")
-    return os.path.abspath(os.path.expanduser(clean))
+    path = os.path.abspath(expanded)
+    try:
+        metadata = os.stat(path)
+    except FileNotFoundError as exc:
+        raise ProfileError(f"el directorio de trabajo no existe: {path}") from exc
+    except PermissionError as exc:
+        raise ProfileError(
+            f"sin permisos para acceder al directorio de trabajo: {path}"
+        ) from exc
+    except OSError as exc:
+        raise ProfileError(
+            f"no se puede acceder al directorio de trabajo {path}: {exc}"
+        ) from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ProfileError(f"el directorio de trabajo no es un directorio: {path}")
+    try:
+        os.scandir(path).close()
+    except PermissionError as exc:
+        raise ProfileError(
+            f"sin permisos para leer el directorio de trabajo: {path}"
+        ) from exc
+    except OSError as exc:
+        raise ProfileError(
+            f"no se puede leer el directorio de trabajo {path}: {exc}"
+        ) from exc
+    return path
 
 
 def _validate_source_id(source_id: str) -> None:
@@ -488,23 +600,32 @@ def dump_profile(profile: Profile) -> str:
         if source.config:
             lines.append(f"config = {_val(dict(source.config))}")
         if source.baseline is not None:
-            lines.append(
-                f"baseline = {_val({
-                    'established_at': source.baseline.established_at,
-                    'work_entries': [
-                        entry.as_dict() for entry in source.baseline.work_entries
-                    ],
-                    'reference_entries': [
-                        entry.as_dict() for entry in source.baseline.reference_entries
-                    ],
-                    'destination_entries': [
-                        entry.as_dict() for entry in source.baseline.destination_entries
-                    ],
-                    'other_reference_paths': list(
-                        source.baseline.other_reference_paths
-                    ),
-                })}"
-            )
+            baseline = source.baseline
+            payload: dict[str, object] = {
+                "established_at": baseline.established_at,
+                "work_entries": [
+                    entry.as_dict() for entry in baseline.work_entries
+                ],
+                "reference_entries": [
+                    entry.as_dict() for entry in baseline.reference_entries
+                ],
+                "destination_entries": [
+                    entry.as_dict() for entry in baseline.destination_entries
+                ],
+                "other_reference_paths": list(baseline.other_reference_paths),
+            }
+            if baseline.work_root:
+                payload["work_root"] = baseline.work_root
+            if baseline.reference_root:
+                payload["reference_root"] = baseline.reference_root
+            if baseline.destination_root:
+                payload["destination_root"] = baseline.destination_root
+            if baseline.other_references:
+                payload["other_references"] = [
+                    snapshot.as_dict()
+                    for snapshot in baseline.other_references
+                ]
+            lines.append(f"baseline = {_val(payload)}")
     for path in sorted(profile.assignments):
         lines += [
             "",
@@ -516,9 +637,9 @@ def dump_profile(profile: Profile) -> str:
 
 
 def dump_exclusions(patterns: list[str]) -> str:
-    return "[exclude]\npatterns = [\n" + "".join(
-        f'  "{p}",\n' for p in patterns
-    ) + "]\n"
+    from .ignore import dump_patterns
+
+    return dump_patterns(patterns)
 
 
 # ----------------------------------------------------------- lectura
@@ -530,6 +651,8 @@ def _load_toml(path: str) -> dict:
             return tomllib.load(f)
     except tomllib.TOMLDecodeError as exc:
         raise ProfileError(f"TOML ilegible en {path}: {exc}") from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ProfileError(f"no se pudo leer {path}: {exc}") from exc
 
 
 def _check_schema(data: dict, path: str) -> None:
@@ -557,15 +680,14 @@ def _load_baseline(raw: object, profile_id: str) -> SourceBaseline | None:
             f"fecha de línea de base inválida en el perfil {profile_id}"
         ) from exc
 
-    def entries_for(key: str) -> tuple[BaselineEntry, ...]:
-        values = raw.get(key)
+    def parse_entries(values: object, label: str) -> tuple[BaselineEntry, ...]:
         if not isinstance(values, list):
-            raise ProfileError(f"elementos de línea de base inválidos: {key}")
+            raise ProfileError(f"elementos de línea de base inválidos: {label}")
         entries: list[BaselineEntry] = []
         seen: set[str] = set()
         for value in values:
             if not isinstance(value, dict):
-                raise ProfileError(f"elemento de línea de base inválido: {key}")
+                raise ProfileError(f"elemento de línea de base inválido: {label}")
             path = value.get("path")
             kind = value.get("kind")
             size = value.get("size")
@@ -586,10 +708,15 @@ def _load_baseline(raw: object, profile_id: str) -> SourceBaseline | None:
                 or not isinstance(sha256, str)
                 or not isinstance(link_target, str)
             ):
-                raise ProfileError(f"elemento de línea de base inválido: {path!r}")
+                raise ProfileError(
+                    f"elemento de línea de base inválido: {path!r} ({label})"
+                )
             seen.add(path)
             entries.append(BaselineEntry(path, kind, size, mode, sha256, link_target))
         return tuple(entries)
+
+    def entries_for(key: str) -> tuple[BaselineEntry, ...]:
+        return parse_entries(raw.get(key), key)
 
     reference_entries = entries_for("reference_entries")
     destination_entries = (
@@ -608,26 +735,90 @@ def _load_baseline(raw: object, profile_id: str) -> SourceBaseline | None:
         raise ProfileError(
             f"rutas de otras referencias inválidas en el perfil {profile_id}"
         )
+
+    def optional_root(key: str) -> str:
+        value = raw.get(key, "")
+        if not isinstance(value, str):
+            raise ProfileError(f"raíz de línea de base inválida: {key}")
+        return value
+
+    raw_other_references = raw.get("other_references", [])
+    if not isinstance(raw_other_references, list):
+        raise ProfileError(
+            f"otras referencias de línea de base inválidas en el perfil {profile_id}"
+        )
+    other_references: list[BaselineSnapshot] = []
+    for index, item in enumerate(raw_other_references):
+        if not isinstance(item, dict):
+            raise ProfileError(
+                f"otra referencia de línea de base inválida en el perfil {profile_id}"
+            )
+        source_id = item.get("source_id", "")
+        role = item.get("role", "other")
+        root = item.get("root", "")
+        if (
+            not isinstance(source_id, str)
+            or not isinstance(role, str)
+            or not role
+            or not isinstance(root, str)
+        ):
+            raise ProfileError(
+                f"otra referencia de línea de base inválida en el perfil {profile_id}"
+            )
+        other_references.append(
+            BaselineSnapshot(
+                source_id=source_id,
+                role=role,
+                root=root,
+                entries=parse_entries(
+                    item.get("entries"),
+                    f"other_references[{index}].entries",
+                ),
+            )
+        )
+
     return SourceBaseline(
         established_at=established_at,
         work_entries=entries_for("work_entries"),
         reference_entries=reference_entries,
         destination_entries=destination_entries,
         other_reference_paths=tuple(sorted(set(other_reference_paths))),
+        other_references=tuple(other_references),
+        work_root=optional_root("work_root"),
+        reference_root=optional_root("reference_root"),
+        destination_root=optional_root("destination_root"),
     )
 
-
 def load_profile(profile_id: str, root: str | None = None) -> Profile:
+    """Carga y valida un perfil. Un TOML corrupto o inconsistente se
+    reporta como ProfileError identificando el perfil y la causa."""
     _validate_id(profile_id)
     path = profile_path(profile_id, root)
+    try:
+        return _load_profile_file(profile_id, path, root)
+    except ProfileError:
+        raise
+    except Exception as exc:
+        raise ProfileError(f"perfil ilegible {path}: {exc}") from exc
+
+
+def _load_profile_file(profile_id: str, path: str, root: str | None) -> Profile:
     data = _load_toml(path)
     _check_schema(data, path)
     if data.get("id") != profile_id:
         raise ProfileError(f"el id del fichero no coincide con el directorio: {path}")
+    raw_view = data.get("view")
+    if raw_view is not None and not isinstance(raw_view, dict):
+        raise ProfileError(f"sección [view] inválida en el perfil {profile_id}")
     view = dict(DEFAULT_VIEW)
-    view.update({k: v for k, v in (data.get("view") or {}).items()})
+    view.update({k: v for k, v in (raw_view or {}).items()})
+    raw_sources = data.get("sources")
+    if raw_sources is not None and not isinstance(raw_sources, list):
+        raise ProfileError(f"sección [[sources]] inválida en el perfil {profile_id}")
     sources = []
-    for raw in data.get("sources") or []:
+    for raw in raw_sources or []:
+        if not isinstance(raw, dict):
+            raise ProfileError(f"fuente inválida en el perfil {profile_id}")
         source = Source(
             id=str(raw.get("id", "")),
             name=str(raw.get("name", "")),
@@ -645,7 +836,13 @@ def load_profile(profile_id: str, root: str | None = None) -> Profile:
         )
         _validate_source(source)
         sources.append(source)
-    source_ids = {source.id for source in sources}
+    source_ids: set[str] = set()
+    for source in sources:
+        if source.id in source_ids:
+            raise ProfileError(
+                f"id de fuente duplicado {source.id!r} en el perfil {profile_id}"
+            )
+        source_ids.add(source.id)
     for source in sources:
         if source.destination_source_id and source.destination_source_id not in source_ids:
             raise ProfileError(
@@ -673,7 +870,7 @@ def load_profile(profile_id: str, root: str | None = None) -> Profile:
     return Profile(
         id=profile_id,
         name=str(data.get("name", "")),
-        work_dir=str(data.get("work_dir", "")),
+        work_dir=_validate_work_dir(str(data.get("work_dir", ""))),
         created=str(data.get("created", "")),
         sources=sources,
         exclusions=_load_exclusions(profile_id, root),
@@ -683,16 +880,26 @@ def load_profile(profile_id: str, root: str | None = None) -> Profile:
 
 
 def _load_exclusions(profile_id: str, root: str | None) -> list[str]:
-    from .ignore import load_patterns
+    from .ignore import PatternsError, load_patterns
 
     path = exclusions_path(profile_id, root)
-    if not os.path.isfile(path):
-        return []
-    return list(load_patterns(path))
+    try:
+        return list(load_patterns(path))
+    except PatternsError as exc:
+        raise ProfileError(
+            f"exclusiones ilegibles en el perfil {profile_id} ({path}): {exc}"
+        ) from exc
 
 
-def list_profiles(root: str | None = None) -> list[Profile]:
-    """Perfiles ordenados por nombre. Un fichero corrupto no impide ver el resto."""
+def list_profiles(
+    root: str | None = None, *, report: list[tuple[str, str]] | None = None
+) -> list[Profile]:
+    """Perfiles ordenados por nombre. Un perfil corrupto no impide ver el resto.
+
+    Si se pasa `report` (lista), se añaden tuplas `(perfil_id, error)` con los
+    perfiles inválidos detectados, de modo que la operación puede informar de
+    ellos sin interrumpir el listado.
+    """
     base = profiles_root(root)
     if not os.path.isdir(base):
         return []
@@ -702,7 +909,9 @@ def list_profiles(root: str | None = None) -> list[Profile]:
             continue
         try:
             out.append(load_profile(name, root))
-        except ProfileError:
+        except ProfileError as exc:
+            if report is not None:
+                report.append((name, str(exc)))
             continue
     out.sort(key=lambda p: p.name.strip().casefold())
     return out
@@ -761,9 +970,16 @@ def save_profile(profile: Profile, root: str | None = None) -> str:
         _validate_relative_path(path)
         if assigned not in seen:
             raise ProfileError(f"asignación a una referencia inexistente: {assigned}")
+    from .ignore import PatternsError, save_patterns
+
+    try:
+        save_patterns(profile.exclusions, exclusions_path(profile.id, root))
+    except PatternsError as exc:
+        raise ProfileError(
+            f"no se pudieron guardar las exclusiones del perfil {profile.id}: {exc}"
+        ) from exc
     path = profile_path(profile.id, root)
     _write_text(path, dump_profile(profile))
-    _write_text(exclusions_path(profile.id, root), dump_exclusions(profile.exclusions))
     return path
 
 

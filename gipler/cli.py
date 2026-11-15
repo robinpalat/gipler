@@ -1,51 +1,30 @@
-"""CLI del motor de análisis (solo lectura).
+"""CLI de Gipler (basada exclusivamente en perfiles).
 
 Uso:
-  python -m gipler.cli analyze
-      [--dev Dev] [--principal Repo] [--addons Repo] [--out INFORME] [--diff RUTA]
-  python -m gipler.cli tui [--demo] [--dev Dev] [--principal Repo] [--addons Repo]
+  python -m gipler.cli analyze-profile PROFILE_ID [--out INFORME]
+  python -m gipler.cli profile-list
+  python -m gipler.cli tui --profile PROFILE_ID [--demo]
   python -m gipler.cli desktop [--uninstall] [--exec ORDEN] [--data-home DIR]
 """
 from __future__ import annotations
 
 import argparse
-import os
 import sys
-
-from .analysis import analyze, diff_for
-from .config import configured_paths
-
-
-def _defaults() -> tuple[str, str, str]:
-    return configured_paths()
-
-
-def _add_paths(p: argparse.ArgumentParser, d_dev, d_main, d_add) -> None:
-    p.add_argument("--dev", default=d_dev)
-    p.add_argument("--principal", default=d_main)
-    p.add_argument("--addons", default=d_add)
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="gipler-cli")
     sub = p.add_subparsers(dest="command", required=True)
-    d_dev, d_main, d_add = _defaults()
-
-    a = sub.add_parser("analyze", help="Informe de análisis (solo lectura)")
-    _add_paths(a, d_dev, d_main, d_add)
-    a.add_argument("--out", default="")
-    a.add_argument("--diff", default="", help="Ruta para mostrar diff Dev vs repo")
 
     pa = sub.add_parser("analyze-profile", help="Informe de análisis comparativo de un perfil")
     pa.add_argument("profile_id")
     pa.add_argument("--out", default="")
 
-    pl = sub.add_parser("profile-list", help="Listar perfiles persistidos")
+    sub.add_parser("profile-list", help="Listar perfiles persistidos")
 
-    t = sub.add_parser("tui", help="Interfaz curses (análisis, navegación, selección, copias controladas)")
-    _add_paths(t, d_dev, d_main, d_add)
+    t = sub.add_parser("tui", help="Interfaz curses de un perfil")
+    t.add_argument("--profile", required=True, help="ID del perfil persistido")
     t.add_argument("--demo", action="store_true", help="Snapshot no interactivo")
-    t.add_argument("--profile", default="", help="Usar el ID de un perfil persistido")
 
     d = sub.add_parser("desktop", help="Instalar/eliminar lanzador .desktop e iconos hicolor")
     d.add_argument("--uninstall", action="store_true", help="Retira lo instalado")
@@ -125,64 +104,21 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(text)
         return 0
 
-    if args.command == "tui":
-        from .tui import make_state, run_curses
+    from .tui import make_profile_state, run_profile_curses
 
-        if args.profile:
-            from .tui import make_profile_state, run_profile_curses
-
-            state = make_profile_state(args.profile)
-            if args.demo:
-                for view in state.views:
-                    state.active_view = view
-                    print(state.render_list())
-                    print(state.render_detail())
-                return 0
-            if not run_profile_curses(state):
-                print("Sin terminal interactiva. Use --demo para inspeccionar.")
-                for view in state.views:
-                    state.active_view = view
-                    print(state.render_list())
-            return 0
-        state = make_state(args.dev, args.principal, args.addons)
-        if args.demo:
-            for tab in ("principal", "addons", "sin determinar"):
-                state.tab = tab
-                print(state.render_list())
-                print(state.render_detail())
-            return 0
-        if not run_curses(state):
-            print("Sin terminal interactiva. Use --demo para inspeccionar.")
+    state = make_profile_state(args.profile)
+    if args.demo:
+        for view in state.views:
+            state.active_view = view
             print(state.render_list())
             print(state.render_detail())
         return 0
-
-    text, rows, info = analyze(args.dev, args.principal, args.addons)
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as f:
-            f.write(text)
-    else:
-        sys.stdout.write(text)
-
-    if args.diff:
-        from .comparator import make_diff
-
-        dev_abs = os.path.join(args.dev, args.diff)
-        # Prueba ambos repos: muestra diff contra el que tenga el archivo.
-        for repo in (args.principal, args.addons):
-            repo_abs = os.path.join(repo, args.diff)
-            if os.path.exists(repo_abs) and os.path.exists(dev_abs):
-                d = make_diff(dev_abs, repo_abs)
-                if d:
-                    sys.stdout.write("\n".join(d) + "\n")
-                else:
-                    sys.stdout.write("(sin diff textual: binario o symlink o idénticos)\n")
-                break
-    sys.stderr.write(
-        "counts: "
-        + ", ".join(f"{k}={v}" for k, v in info["counts"].items())
-        + "\n"
-    )
+    if not run_profile_curses(state):
+        print("Sin terminal interactiva. Use --demo para inspeccionar.")
+        for view in state.views:
+            state.active_view = view
+            print(state.render_list())
+        print(state.render_detail())
     return 0
 
 

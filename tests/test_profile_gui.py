@@ -1,4 +1,4 @@
-"""Profile workspace GUI tests; no real copies or repository writes."""
+"""GUI del sistema de perfiles (ventana principal); sin copias reales."""
 from __future__ import annotations
 
 import os
@@ -12,6 +12,7 @@ from PySide6.QtCore import QModelIndex, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QFrame,
     QLabel,
     QListWidget,
     QMessageBox,
@@ -31,7 +32,6 @@ from gipler.profile import (
 from gipler.report import Row
 from gipler.gui.profile_window import (
     EstablishBaselineDialog,
-    ProfileWindow,
     SourceDialog,
 )
 from gipler.gui.main_window import GiplerWindow
@@ -41,7 +41,7 @@ from gipler.recognition import MembershipState
 APP = QApplication.instance() or QApplication([])
 
 
-class ProfileWorkspaceGuiTests(unittest.TestCase):
+class ProfileGuiTests(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.TemporaryDirectory()
         self.old_home = os.environ.get("HOME")
@@ -74,8 +74,6 @@ class ProfileWorkspaceGuiTests(unittest.TestCase):
                 config={"patterns": ["**"]},
             ),
         ]
-        from gipler.profile import save_profile
-
         save_profile(self.profile)
 
     def _restore_home(self):
@@ -92,16 +90,16 @@ class ProfileWorkspaceGuiTests(unittest.TestCase):
             file.write(text)
 
     def _window(self):
-        window = ProfileWindow(load_profile(self.profile.id))
+        window = GiplerWindow(profile=load_profile(self.profile.id))
         self.addCleanup(window.close)
         return window
 
     @staticmethod
-    def _index_for_path(page, path):
+    def _index_for_path(model, path):
         def find(parent):
-            for index in range(page.model.rowCount(parent)):
-                child = page.model.index(index, 0, parent)
-                node = page.model.node_at(child)
+            for index in range(model.rowCount(parent)):
+                child = model.index(index, 0, parent)
+                node = model.node_at(child)
                 if node.path == path:
                     return child
                 nested = find(child)
@@ -109,78 +107,24 @@ class ProfileWorkspaceGuiTests(unittest.TestCase):
                     return nested
             return None
 
-        return find(page.model.index(-1, 0))
+        return find(model.index(-1, 0))
 
-    def test_tab_order_and_permanent_admin_tabs(self):
-        window = self._window()
-        self.assertEqual(
-            [window.tabs.tabText(i) for i in range(window.tabs.count())],
-            ["Inicio", "Referencia", "Desactivada (desactivada)", "Excluidos", "Indeterminados"],
-        )
-        self.assertIsNone(
-            window.tabs.tabBar().tabButton(
-                3, window.tabs.tabBar().ButtonPosition.LeftSide
-            )
-        )
-        self.assertEqual(window.tabs.tabText(3), "Excluidos")
-        self.assertEqual(window.tabs.tabText(4), "Indeterminados")
+    @staticmethod
+    def _index_for_path_in_model(model, path):
+        def find(parent):
+            for index in range(model.rowCount(parent)):
+                child = model.index(index, 0, parent)
+                node = model.node_at(child)
+                if node.path == path:
+                    return child
+                nested = find(child)
+                if nested is not None:
+                    return nested
+            return None
 
-    def test_home_lists_all_physical_files_and_directories(self):
-        window = self._window()
-        home_page = window.tabs.widget(0)
-        paths = {
-            home_page.list.item(index).data(Qt.UserRole).path
-            for index in range(home_page.list.count())
-        }
-        self.assertEqual(paths, {".hidden", "folder", "folder/file.txt", "excluded.txt"})
+        return find(model.index(-1, 0))
 
-    def test_empty_excluded_tab_has_exact_message(self):
-        window = self._window()
-        excluded_page = window.tabs.widget(window.tabs.count() - 2)
-        self.assertEqual(excluded_page.empty_label.text(), "Ningún archivo excluido")
-        self.assertFalse(excluded_page.empty_label.isHidden())
-        self.assertEqual(excluded_page.list.count(), 0)
-
-    def test_excluded_tab_marks_inherited_children_and_restore_is_non_destructive(self):
-        add_exclusion(self.profile.id, "folder/")
-        window = self._window()
-        excluded_page = window.tabs.widget(window.tabs.count() - 2)
-        entries = [
-            excluded_page.list.item(index).data(Qt.UserRole)
-            for index in range(excluded_page.list.count())
-        ]
-        by_path = {entry.path: entry for entry in entries}
-        self.assertIn("folder", by_path)
-        self.assertIn("folder/file.txt", by_path)
-        self.assertFalse(by_path["folder"].exclusion_inherited)
-        self.assertTrue(by_path["folder/file.txt"].exclusion_inherited)
-        self.assertIn("heredada", excluded_page.list.item(1).text())
-        self.assertTrue(os.path.isfile(os.path.join(self.work, "folder", "file.txt")))
-
-    def test_indeterminate_tab_and_resolve_using_rules(self):
-        window = self._window()
-        indeterminate_index = window.tabs.count() - 1
-        indeterminate = window.tabs.widget(indeterminate_index)
-        paths = {
-            indeterminate.list.item(index).data(Qt.UserRole).path
-            for index in range(indeterminate.list.count())
-        }
-        self.assertIn("excluded.txt", paths)
-        unknown = next(
-            entry for entry in window.analysis.indeterminate if entry.path == "excluded.txt"
-        )
-        self.assertEqual(unknown.membership.state, MembershipState.UNKNOWN)
-
-    def test_disabled_source_retains_tab_and_is_not_an_active_recognizer(self):
-        window = self._window()
-        disabled = window._source_pages["src_disabled"]
-        self.assertFalse(disabled.isEnabled())
-        self.assertEqual(disabled.model.file_nodes(), [])
-        self.assertEqual(
-            load_profile(self.profile.id).source("src_disabled").config,
-            {"patterns": ["**"]},
-        )
-
+    # -------------------------------------------------- componentes compartidos
     def test_source_edit_keeps_persistent_id_and_order(self):
         source = self.profile.sources[0]
         dialog = SourceDialog(source)
@@ -365,6 +309,55 @@ class ProfileWorkspaceGuiTests(unittest.TestCase):
         configured = dialog.configured_source()
         self.assertEqual(configured.kind, "git_repository")
         self.assertEqual(configured.config, source.config)
+
+    # -------------------------------------------------- ventana principal
+    def test_home_lists_all_physical_files_and_directories(self):
+        window = self._window()
+        paths = {
+            window.inicio_panel.list.item(index).data(Qt.UserRole).path
+            for index in range(window.inicio_panel.list.count())
+        }
+        self.assertEqual(paths, {"folder/file.txt"})
+
+    def test_empty_excluded_tab_has_exact_message(self):
+        window = self._window()
+        excluded_page = window._profile_admin_pages["excluidos"]
+        self.assertEqual(excluded_page.empty_label.text(), "Ningún archivo excluido")
+        self.assertFalse(excluded_page.empty_label.isHidden())
+
+    def test_excluded_tab_marks_inherited_children_and_restore_is_non_destructive(self):
+        add_exclusion(self.profile.id, "folder/")
+        window = self._window()
+        excluded_page = window._profile_admin_pages["excluidos"]
+        entries = [
+            excluded_page.list.item(index).data(Qt.UserRole)
+            for index in range(excluded_page.list.count())
+        ]
+        by_path = {entry.path: entry for entry in entries}
+        self.assertFalse(by_path["folder"].exclusion_inherited)
+        self.assertTrue(by_path["folder/file.txt"].exclusion_inherited)
+        self.assertTrue(os.path.isfile(os.path.join(self.work, "folder", "file.txt")))
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes):
+            window._restore_profile_exclusion(by_path["folder"])
+        self.assertTrue(os.path.isfile(os.path.join(self.work, "folder", "file.txt")))
+        self.assertNotIn("folder/", load_profile(self.profile.id).exclusions)
+
+    def test_indeterminate_tab_and_resolve_using_rules(self):
+        window = self._window()
+        page = window._profile_admin_pages["indeterminados"]
+        labels = {
+            page.list.item(index).data(Qt.UserRole).path:
+            page.list.item(index).text()
+            for index in range(page.list.count())
+        }
+        self.assertIn("[Sin reconocimiento]", labels["excluded.txt"])
+
+    def test_disabled_source_is_not_an_active_recognizer(self):
+        window = self._window()
+        self.assertIn("src_disabled", window.repo_names())
+        self.assertFalse(window.repo_buttons["src_disabled"].isEnabled())
+        source = window.profile.source("src_disabled")
+        self.assertFalse(source.enabled and source.acts_as_recognizer)
 
     def test_empty_profile_always_has_admin_pages_and_order_after_reopen(self):
         empty_work = os.path.join(self.tmp.name, "empty-work")
@@ -644,6 +637,7 @@ class ProfileWorkspaceGuiTests(unittest.TestCase):
 
         return find()
 
+    # -------------------------------------------------- arranque
     def test_main_opens_profile_directly_in_main_window(self):
         source = self.profile.sources[0]
         source.acts_as_destination = True
@@ -663,7 +657,6 @@ class ProfileWorkspaceGuiTests(unittest.TestCase):
         window = APP._gipler_window
         self.addCleanup(window.close)
         self.assertIsInstance(window, GiplerWindow)
-        self.assertNotIsInstance(window, ProfileWindow)
         self.assertEqual(window.profile.id, self.profile.id)
         self.assertEqual(window.repo_names(), ["src_reference", "src_disabled"])
         self.assertEqual(window._repo_root_for("src_reference"), self.reference)
@@ -682,41 +675,60 @@ class ProfileWorkspaceGuiTests(unittest.TestCase):
             for action in window.menuBar().actions()
             if action.text() == "Perfiles"
         )
-        self.assertIn(
-            "Administrar perfiles…",
-            {action.text() for action in profile_menu.actions()},
-        )
+        menu_labels = {action.text() for action in profile_menu.actions()}
+        self.assertIn("Cambiar perfil…", menu_labels)
+        self.assertIn("Administrar perfil…", menu_labels)
+        self.assertNotIn("Administrar perfiles…", menu_labels)
+        self.assertNotIn("Renombrar perfil…", menu_labels)
+        self.assertNotIn("Cambiar directorio de trabajo…", menu_labels)
+        self.assertNotIn("Administrar referencias…", menu_labels)
 
-    def test_main_without_profiles_opens_empty_window_and_keeps_admin_menu(self):
+    def test_main_without_profiles_opens_launcher(self):
         from gipler.gui.main_window import main
+        from gipler.gui.profile_window import ProfileLauncherDialog
 
         with tempfile.TemporaryDirectory() as empty_home:
             old_home = os.environ.get("HOME")
             os.environ["HOME"] = empty_home
             try:
-                with patch.object(QApplication, "exec", return_value=0):
+                if hasattr(APP, "_gipler_window"):
+                    del APP._gipler_window
+                with patch.object(
+                    ProfileLauncherDialog, "exec", return_value=QDialog.Rejected
+                ), patch.object(QApplication, "exec", return_value=0):
+                    self.assertEqual(main(), 0)
+                self.assertFalse(hasattr(APP, "_gipler_window"))
+                self.assertEqual(list_profiles(), [])
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+
+    def test_main_without_profiles_opens_selected_profile(self):
+        from gipler.gui.main_window import main
+        from gipler.gui.profile_window import ProfileLauncherDialog
+
+        with tempfile.TemporaryDirectory() as empty_home:
+            old_home = os.environ.get("HOME")
+            os.environ["HOME"] = empty_home
+            try:
+                work = os.path.join(empty_home, "work")
+                os.makedirs(work)
+                profile = create_profile("Nuevo", work)
+                save_profile(profile)
+
+                def choose(dialog):
+                    dialog.profile_id = profile.id
+                    return QDialog.Accepted
+
+                with patch.object(
+                    ProfileLauncherDialog, "exec", side_effect=choose
+                ), patch.object(QApplication, "exec", return_value=0):
                     self.assertEqual(main(), 0)
                 window = APP._gipler_window
                 self.addCleanup(window.close)
-                self.assertIsNone(window.profile)
-                self.assertEqual(window.rows, [])
-                self.assertEqual(window.meta, {})
-                self.assertFalse(window.inicio_panel.empty_state.isHidden())
-                self.assertIn(
-                    "No hay ningún perfil abierto",
-                    window.inicio_panel.empty_state.text(),
-                )
-                profile_menu = next(
-                    action.menu()
-                    for action in window.menuBar().actions()
-                    if action.text() == "Perfiles"
-                )
-                self.assertIn(
-                    "Administrar perfiles…",
-                    {action.text() for action in profile_menu.actions()},
-                )
-                self.assertEqual(list_profiles(), [])
-                self.assertEqual(window.reanalyze(), "Sin perfil abierto")
+                self.assertEqual(window.profile.id, profile.id)
             finally:
                 if old_home is None:
                     os.environ.pop("HOME", None)
@@ -755,46 +767,25 @@ class ProfileWorkspaceGuiTests(unittest.TestCase):
         self.assertEqual(second.profile.id, self.profile.id)
 
     def test_empty_window_opens_profile_from_admin_dialog(self):
-        from gipler.gui.profile_window import ProfileLauncherDialog
-
-        window = GiplerWindow()
-        self.addCleanup(window.close)
+        second = create_profile("Segundo", self.work)
+        second.sources = [
+            Source(id="src_second", name="Second", root=self.reference, order=0)
+        ]
+        save_profile(second)
+        window = self._window()
 
         def choose_profile(dialog):
-            dialog.profile_id = self.profile.id
+            dialog.profile_id = second.id
             return QDialog.Accepted
 
-        with patch.object(ProfileLauncherDialog, "exec", choose_profile):
+        with patch(
+            "gipler.gui.profile_window.ProfileLauncherDialog.exec", choose_profile
+        ):
             window._manage_profiles()
         replacement = APP._gipler_window
         self.addCleanup(replacement.close)
         self.assertIsNot(replacement, window)
-        self.assertEqual(replacement.profile.id, self.profile.id)
-
-    def test_legacy_command_opens_existing_fixed_flow(self):
-        from gipler.gui import legacy
-
-        row = Row("a.txt", "núcleo", "principal", "identical", "tracked_clean", [])
-        info = {
-            "meta": {"dev": "/tmp/dev", "principal": "/tmp/principal", "addons": "/tmp/addons"},
-            "warnings": [],
-            "snapshot": {"dev": {}, "repos": {}},
-        }
-
-        with patch(
-            "gipler.config.configured_paths",
-            return_value=("/tmp/dev", "/tmp/principal", "/tmp/addons"),
-        ), patch(
-            "gipler.analysis.analyze",
-            return_value=("report", [row], info),
-        ), patch.object(QApplication, "exec", return_value=7):
-            self.assertEqual(legacy.main(), 7)
-        window = APP._gipler_window
-        self.addCleanup(window.close)
-        self.assertIsNone(window.profile)
-        self.assertEqual(window.rows, [row])
-        self.assertEqual(window.meta["dev"], "/tmp/dev")
-        self.assertEqual(window._destination, "principal")
+        self.assertEqual(replacement.profile.id, second.id)
 
     def test_profile_menu_switches_workspace_without_mixing_references(self):
         second_work = os.path.join(self.tmp.name, "second-work")
@@ -811,14 +802,14 @@ class ProfileWorkspaceGuiTests(unittest.TestCase):
         first_window = GiplerWindow(profile=load_profile(self.profile.id))
         self.addCleanup(first_window.close)
 
-        from gipler.gui.profile_window import ProfileLauncherDialog
-
         def choose_second(dialog):
             dialog.profile_id = second.id
             return QDialog.Accepted
 
-        with patch.object(ProfileLauncherDialog, "exec", choose_second):
-            first_window._manage_profiles()
+        with patch(
+            "gipler.gui.main_window.ProfileSwitchDialog.exec", choose_second
+        ):
+            first_window._switch_profile()
         second_window = APP._gipler_window
         self.addCleanup(second_window.close)
         self.assertEqual(second_window.profile.id, second.id)
@@ -868,22 +859,7 @@ class ProfileWorkspaceGuiTests(unittest.TestCase):
             {"Herramientas", "Perfiles"},
         )
 
-    @staticmethod
-    def _index_for_path_in_model(model, path):
-        def find(parent):
-            for index in range(model.rowCount(parent)):
-                child = model.index(index, 0, parent)
-                node = model.node_at(child)
-                if node.path == path:
-                    return child
-                nested = find(child)
-                if nested is not None:
-                    return nested
-            return None
-
-        return find(model.index(-1, 0))
-
-    def test_copy_selection_syncs_between_home_and_source_and_prepares_only(self):
+    def test_copy_selection_syncs_between_home_and_prepares_only(self):
         destination = os.path.join(self.tmp.name, "destination")
         os.makedirs(destination)
         source = self.profile.sources[0]
@@ -892,34 +868,98 @@ class ProfileWorkspaceGuiTests(unittest.TestCase):
         source.sync_destination = destination
         save_profile(self.profile)
         window = self._window()
-        home_page = window.tabs.widget(0)
         home_item = next(
-            home_page.list.item(index)
-            for index in range(home_page.list.count())
-            if home_page.list.item(index).data(Qt.UserRole).path == "folder/file.txt"
+            window.inicio_panel.list.item(index)
+            for index in range(window.inicio_panel.list.count())
+            if window.inicio_panel.list.item(index).data(Qt.UserRole).path == "folder/file.txt"
         )
         self.assertTrue(home_item.flags() & Qt.ItemIsUserCheckable)
         home_item.setCheckState(Qt.Checked)
         key = ("src_reference", "folder/file.txt")
         self.assertIn(key, window.selection_ctrl)
         selected_before_inspection = set(window.selection_ctrl.keys)
-        home_page.list.setCurrentItem(home_item)
+        window.inicio_panel.list.setCurrentItem(home_item)
         self.assertEqual(window.selection_ctrl.keys, selected_before_inspection)
 
-        source_page = window._source_pages["src_reference"]
-        source_index = self._index_for_path(source_page, "folder/file.txt")
-        self.assertIsNotNone(source_index)
-        self.assertEqual(source_page.model.data(source_index, Qt.CheckStateRole), Qt.Checked)
+        index = self._index_for_path_in_model(window.tree_model, "folder/file.txt")
+        self.assertIsNotNone(index)
+        self.assertEqual(
+            window.tree_model.data(index, Qt.CheckStateRole), Qt.Checked
+        )
         operations = window.prepare_operations()
         self.assertEqual(len(operations), 1)
         self.assertEqual(operations[0].status, "copiable")
         self.assertEqual(window.btn_execute.text(), "Ejecutar copia (1)")
         self.assertFalse(os.path.exists(os.path.join(destination, "folder", "file.txt")))
 
-        window.tabs.setCurrentIndex(0)
-        window.tabs.setCurrentIndex(1)
+        window._show_inicio()
+        window._show_compare("src_reference")
         self.assertIn(key, window.selection_ctrl)
         self.assertEqual(window.ops_cache, operations)
+
+    def test_reference_toolbar_search_filters_counter_view_and_refresh(self):
+        window = self._window()
+        window.show()
+        window._show_compare("src_reference")
+        APP.processEvents()
+        bar = window.findChild(QFrame, "referenceControls")
+        self.assertIsNotNone(bar)
+        labels = [label.text() for label in bar.findChildren(QLabel)]
+        self.assertIn("Vista", labels)
+        self.assertIn("Filtro", labels)
+        self.assertTrue(window.axis_b_box.isVisible())
+        self.assertTrue(window.incidences_box.isVisible())
+        self.assertTrue(window.owner_box.isVisible())
+        self.assertFalse(hasattr(window, "filter_button"))
+        self.assertEqual(
+            [window.axis_b_box.itemText(index) for index in range(window.axis_b_box.count())],
+            ["todos", "tracked_modified", "tracked_clean", "untracked", "ignored"],
+        )
+        self.assertEqual(window.axis_b_box.currentData(), "todos")
+        self.assertLess(window.axis_a_box.geometry().right(), window.axis_b_box.geometry().left())
+        self.assertFalse(window.search_edit.isVisible())
+        self.assertTrue(window.visible_counter.isVisible())
+        self.assertIn("visibles", window.visible_counter.text())
+        self.assertTrue(
+            any(
+                label.objectName() == "contextLabel"
+                for label in bar.findChildren(QLabel)
+            )
+        )
+        self.assertEqual(
+            window.axis_a_box.mapTo(bar, window.axis_a_box.rect().topLeft()).y(),
+            window.visible_counter.mapTo(
+                bar, window.visible_counter.rect().topLeft()
+            ).y(),
+        )
+
+        window.search_button.click()
+        APP.processEvents()
+        self.assertTrue(window.search_edit.isVisible())
+        window.search_edit.setText("file.txt")
+        self.assertEqual(window.proxy.search, "file.txt")
+        window.search_button.click()
+        APP.processEvents()
+        self.assertFalse(window.search_edit.isVisible())
+        self.assertEqual(window.search_edit.text(), "")
+        self.assertEqual(window.proxy.search, "")
+
+        window.axis_b_box.setCurrentIndex(
+            window.axis_b_box.findData("tracked_modified")
+        )
+        self.assertEqual(window.axis_b_box.currentData(), "tracked_modified")
+        self.assertEqual(window.proxy.axis_b, "tracked_modified")
+        window.incidences_box.setChecked(True)
+        self.assertTrue(window.proxy.only_incidences)
+        window.axis_a_box.setCurrentIndex(
+            window.axis_a_box.findData("modified_in_dev")
+        )
+        window.axis_a_box.setCurrentIndex(window.axis_a_box.findData("todos"))
+        self.assertEqual(window.axis_b_box.currentData(), "tracked_modified")
+        self.assertTrue(window.proxy.only_incidences)
+        window.refresh_button.click()
+        APP.processEvents()
+        self.assertIn("visibles", window.visible_counter.text())
 
     def test_ineligible_unknown_and_excluded_items_have_no_copy_checkbox(self):
         add_exclusion(self.profile.id, "excluded.txt")
@@ -931,71 +971,73 @@ class ProfileWorkspaceGuiTests(unittest.TestCase):
         os.makedirs(source.sync_destination)
         save_profile(self.profile)
         window = self._window()
-        home_page = window.tabs.widget(0)
         items = {
-            home_page.list.item(index).data(Qt.UserRole).path:
-            home_page.list.item(index)
-            for index in range(home_page.list.count())
+            window.inicio_panel.list.item(index).data(Qt.UserRole).path:
+            window.inicio_panel.list.item(index)
+            for index in range(window.inicio_panel.list.count())
         }
         self.assertNotIn("excluded.txt", items)
-        self.assertFalse(items[".hidden"].flags() & Qt.ItemIsUserCheckable)
+        self.assertNotIn(".hidden", items)
         self.assertTrue(items["folder/file.txt"].flags() & Qt.ItemIsUserCheckable)
 
     def test_source_tab_displays_comparison_rows_and_double_click_uses_reference_root(self):
+        from gipler.gui.comparison_window import ComparisonWindow
+
         self._write(self.reference, "only-reference.txt", "reference")
         window = self._window()
-        page = window._source_pages["src_reference"]
         row = next(
-            row for row in window.analysis.rows_by_source["src_reference"]
+            row for row in window.profile_analysis.rows_by_source["src_reference"]
             if row.path == "only-reference.txt"
         )
         self.assertEqual(row.axis_a, "missing_in_dev")
-        page.activated.emit(row, "src_reference")
-        comparison = window._comparison_windows[-1]
-        self.assertEqual(comparison.dev_root, self.work)
-        self.assertEqual(comparison.repo_root, self.reference)
+        before = set(window.findChildren(ComparisonWindow))
+        window.open_comparison(row)
+        opened = [w for w in window.findChildren(ComparisonWindow) if w not in before]
+        self.assertTrue(opened)
+        self.assertEqual(opened[-1].dev_root, self.work)
+        self.assertEqual(opened[-1].repo_root, self.reference)
+        opened[-1].close()
 
-    def test_selecting_source_comparison_updates_original_inspector(self):
+    def test_selecting_source_comparison_updates_home_info(self):
         window = self._window()
         entry = next(
-            entry for entry in window.analysis.source_entries["src_reference"]
+            entry for entry in window.profile_analysis.source_entries["src_reference"]
             if entry.path == "folder/file.txt"
         )
-        window._inspect_entry(entry, "src_reference")
-        self.assertIn(
-            "Estado A (Dev↔repo): modified_in_dev",
-            window.inspector.summary.toPlainText(),
+        window.inicio_panel.inspect_row(
+            next(
+                row for row in window.profile_analysis.rows_by_source["src_reference"]
+                if row.path == "folder/file.txt"
+            )
         )
-        self.assertIn("Pertenencia: recognized", window.inspector.summary.toPlainText())
+        self.assertIn("folder/file.txt", window.inicio_panel.file_info.text())
 
     def test_excluding_comparison_path_refreshes_profile_without_touching_files(self):
         window = self._window()
         absolute = os.path.join(self.work, "folder", "file.txt")
-        window._exclude_path("folder/file.txt")
+        window.exclude_path("folder/file.txt", False)
         self.assertTrue(os.path.isfile(absolute))
         self.assertNotIn(
             "folder/file.txt",
-            {entry.path for entry in window.analysis.entries},
+            {entry.path for entry in window.profile_analysis.entries},
         )
         self.assertIn(
             "folder/file.txt",
-            {entry.path for entry in window.analysis.inventory.excluded},
+            {entry.path for entry in window.profile_analysis.inventory.excluded},
         )
 
     def test_opening_a_missing_side_uses_the_physical_parent_directory(self):
         self._write(self.reference, "only-reference.txt", "reference")
         window = self._window()
-        page = window._source_pages["src_reference"]
         row = next(
-            row for row in window.analysis.rows_by_source["src_reference"]
+            row for row in window.profile_analysis.rows_by_source["src_reference"]
             if row.path == "only-reference.txt"
         )
         self.assertEqual(row.axis_a, "missing_in_dev")
         with patch(
-            "gipler.gui.profile_window.QDesktopServices.openUrl",
-            return_value=True,
+            "PySide6.QtGui.QDesktopServices.openUrl", return_value=True
         ) as open_url:
-            page.dev_panel._open_in_explorer("only-reference.txt", False)
+            window.dev_panel._open_in_explorer("only-reference.txt", False)
         self.assertEqual(open_url.call_args.args[0].toLocalFile(), self.work)
 
 

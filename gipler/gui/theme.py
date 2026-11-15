@@ -91,10 +91,6 @@ QComboBox, QLineEdit {{ background: {c['tabla']}; color: {c['texto']};
     border: 1px solid {c['borde']}; padding: 3px 4px; }}
 QTreeView {{ background: {c['tabla']}; color: {c['texto']};
     alternate-background-color: {c['panel2']}; selection-background-color: {c['seleccion']}; }}
-QTabWidget::pane {{ background: {c['tabla']}; border: 1px solid {c['borde']}; }}
-QTabBar::tab {{ background: {c['panel']}; color: {c['texto2']}; padding: 6px 12px;
-    border: 1px solid {c['borde']}; }}
-QTabBar::tab:selected {{ color: {c['texto']}; background: {c['panel2']}; }}
 QPlainTextEdit, QTableWidget {{ background: {c['tabla']}; color: {c['texto']}; }}
 QStatusBar {{ background: {c['panel']}; color: {c['texto2']}; }}
 QScrollBar:vertical {{ background: {c['panel']}; width: 12px; }}
@@ -108,15 +104,26 @@ QLabel {{ color: {c['texto']}; }}
 """
 
 
+_APPLIED_THEME: str | None = None
+
+
 def apply_theme(theme: str) -> None:
+    global _APPLIED_THEME
+    if _APPLIED_THEME == theme:
+        save_preference(theme)
+        return
+    _APPLIED_THEME = theme
+    # Persistir antes de aplicar permite que los widgets que reaccionan a
+    # PaletteChange (p. ej. SummaryPanel) lean ya el tema nuevo.
+    save_preference(theme)
     app = QApplication.instance()
     if app is not None:
-        from gipler.gui import icons
+        from gipler.gui import icons, styles
 
         icons.clear_cache()
         app.setPalette(palette(theme))
         app.setStyleSheet(stylesheet(theme))
-    save_preference(theme)
+        styles.apply_common_style(app, theme)
 
 
 def semantic(theme: str, key: str) -> str:

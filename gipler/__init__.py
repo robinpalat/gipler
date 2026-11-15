@@ -1,5 +1,5 @@
-"""Gipler — motor de análisis (Fases 1-4, solo lectura).
+"""Gipler — motor de análisis de perfiles (solo lectura).
 
-Spec v4.0: scanner -> classifier -> comparator -> report.
+Flujo: scanner -> recognition -> comparator -> profile_analysis -> report.
 Solo lectura: nunca copia, mueve, borra ni ejecuta git add/commit/push/checkout.
 """

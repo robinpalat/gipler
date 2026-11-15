@@ -31,18 +31,7 @@ class SelectionController:
 
 
 def is_safe(row) -> bool:
-    """Criterio interactivo de selección segura (TUI, sin duplicar
-    clasificaciones del motor): propietario/destino conocidos, sin
-    incidencias bloqueantes, sin tracked_modified ni ignored."""
-    if row.destination not in ("principal", "addons"):
-        return False
-    if not row.owner or row.owner == "sin determinar":
-        return False
-    if row.axis_b in ("tracked_modified", "ignored"):
-        return False
-    bad = {
-        "shared_file", "status_unrecognized", "status_development",
-        "unknown_owner", "ambiguous", "external_dependency",
-        "path_outside_prefix", "symlink_escapes_allowed_dirs", "excluded",
-    }
-    return not (bad & set(row.incidences))
+    """Selección segura según la política única de copia."""
+    from gipler.copy_policy import static_row_blockers
+
+    return not static_row_blockers(row)

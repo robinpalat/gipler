@@ -6,10 +6,15 @@ import os
 from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMenu,
+    QPushButton,
+    QSizePolicy,
     QTreeView,
     QVBoxLayout,
     QWidget,
@@ -22,6 +27,20 @@ from gipler.gui.models.filter_model import FilterModel
 
 DEV_HEADERS = ("Nombre", "Estado del destino", "Advertencias")
 REPO_HEADERS = ("Nombre", "Estado Git", "Advertencias")
+
+
+class DirectoryHeaderTitle(ElidedLabel):
+    """Etiqueta de directorio que se dimensiona a su texto y elide si no cabe."""
+
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        return QSize(
+            self.fontMetrics().horizontalAdvance(self.full_text()) + 8,
+            self.fontMetrics().height(),
+        )
+
+    def setText(self, text: str, tooltip: str | None = None) -> None:  # type: ignore[override]
+        super().setText(text, tooltip)
+        self.updateGeometry()
 
 
 class PanelProxy(FilterModel):
@@ -75,24 +94,40 @@ class PanelProxy(FilterModel):
 
 class ComparisonPanel(QWidget):
     exclude_requested = Signal(str)
+    select_all_commit_changed = Signal(int)
+    commit_requested = Signal()
+    commit_confirmed = Signal(str)
+    commit_cancelled = Signal()
 
     def __init__(self, title: str, parent=None):
         super().__init__(parent)
         self.is_dev = title == "Dev"
-        self.header = QHBoxLayout()
-        self.header.setContentsMargins(0, 0, 0, 0)
+        self.directory_header = QFrame()
+        self.directory_header.setObjectName("directoryHeader")
+        self.directory_header.setFrameShape(QFrame.Shape.NoFrame)
+        self.directory_header.setSizePolicy(
+            QSizePolicy.Maximum, QSizePolicy.Fixed
+        )
+        self.header = QHBoxLayout(self.directory_header)
+        self.header.setContentsMargins(10, 2, 10, 2)
         self.header.setSpacing(6)
         self.folder_icon = QLabel()
-        self.folder_icon.setVisible(False)
-        self.folder_icon.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.folder_icon.setVisible(True)
+        self.folder_icon.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
         self._folder_icon_color = icons.current_color()
         self._folder_icon_pending = False
         self._refresh_folder_icon(force=True)
-        self.folder_icon.setAccessibleName("Directorio de referencia")
-        self.header.addWidget(self.folder_icon, 0, Qt.AlignVCenter)
-        self.title_label = ElidedLabel(title)
+        self.folder_icon.setAccessibleName("Directorio")
+        self.title_label = DirectoryHeaderTitle(title)
+        self.title_label.setObjectName("directoryHeaderTitle")
+        self.title_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         self.title_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        self.header.addWidget(self.title_label, 1, Qt.AlignVCenter)
+        header_font = self.title_label.font()
+        header_font.setWeight(QFont.Weight.DemiBold)
+        header_font.setPointSizeF(header_font.pointSizeF() + 0.5)
+        self.title_label.setFont(header_font)
+        self.header.addWidget(self.folder_icon, 0, Qt.AlignVCenter)
+        self.header.addWidget(self.title_label, 0, Qt.AlignVCenter)
         self._header_extra = None
         self.tree = QTreeView()
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -106,13 +141,137 @@ class ComparisonPanel(QWidget):
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.Interactive)
         self._headers = DEV_HEADERS if self.is_dev else REPO_HEADERS
-        layout = QVBoxLayout(self)
-        layout.addLayout(self.header)
-        layout.addWidget(self.tree)
         self.empty_label = QLabel()
         self.empty_label.setAlignment(Qt.AlignCenter)
         self.empty_label.setVisible(False)
-        layout.addWidget(self.empty_label)
+        self.content = QWidget()
+        self.content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        content_layout = QVBoxLayout(self.content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        self._build_commit_controls()
+        content_layout.addWidget(self.commit_bar)
+        content_layout.addWidget(self.commit_warning)
+        content_layout.addWidget(self.commit_error)
+        content_layout.addWidget(self.commit_message_row)
+        content_layout.addWidget(self.tree, 1)
+        content_layout.addWidget(self.empty_label, 1)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 9, 12, 9)
+        layout.addWidget(self.directory_header, 0, Qt.AlignLeft)
+        layout.addWidget(self.content, 1)
+
+    def _build_commit_controls(self) -> None:
+        self.commit_bar = QWidget()
+        commit_layout = QHBoxLayout(self.commit_bar)
+        commit_layout.setContentsMargins(0, 0, 0, 0)
+        self.select_all_commit = QCheckBox("Seleccionar todos")
+        self.select_all_commit.setTristate(True)
+        self.commit_count_label = QLabel("")
+        self.commit_button = QPushButton("Confirmar selección")
+        self.commit_button.setToolTip(
+            "Confirmar un commit con los archivos seleccionados en esta vista"
+        )
+        self.commit_button.setEnabled(False)
+        commit_layout.addWidget(self.select_all_commit)
+        commit_layout.addWidget(self.commit_count_label)
+        commit_layout.addStretch(1)
+        commit_layout.addWidget(self.commit_button)
+        self.commit_bar.setVisible(False)
+
+        self.commit_warning = QLabel()
+        self.commit_warning.setWordWrap(True)
+        self.commit_warning.setVisible(False)
+        self.commit_error = QLabel()
+        self.commit_error.setWordWrap(True)
+        self.commit_error.setVisible(False)
+        self.commit_error.setStyleSheet("color: #C0504D;")
+
+        self.commit_message_row = QWidget()
+        message_layout = QVBoxLayout(self.commit_message_row)
+        message_layout.setContentsMargins(0, 0, 0, 0)
+        top_row = QHBoxLayout()
+        self.commit_message_edit = QLineEdit()
+        self.commit_message_edit.setPlaceholderText("Mensaje del commit...")
+        self.commit_message_edit.setAccessibleName("Mensaje del commit")
+        self.commit_confirm_button = QPushButton("Confirmar")
+        self.commit_cancel_button = QPushButton("Cancelar")
+        top_row.addWidget(self.commit_message_edit, 1)
+        top_row.addWidget(self.commit_confirm_button)
+        top_row.addWidget(self.commit_cancel_button)
+        self.commit_include_staged = QCheckBox(
+            "Incluir archivos previamente preparados"
+        )
+        self.commit_include_staged.setVisible(False)
+        message_layout.addLayout(top_row)
+        message_layout.addWidget(self.commit_include_staged)
+        self.commit_message_row.setVisible(False)
+
+        self.select_all_commit.stateChanged.connect(
+            self.select_all_commit_changed
+        )
+        self.commit_button.clicked.connect(self.commit_requested)
+        self.commit_confirm_button.clicked.connect(
+            lambda: self.commit_confirmed.emit(self.commit_message_edit.text())
+        )
+        self.commit_cancel_button.clicked.connect(self.commit_cancelled)
+
+    def set_commit_mode(self, enabled: bool) -> None:
+        self.commit_bar.setVisible(enabled)
+        if not enabled:
+            self.reset_commit_form()
+
+    def set_commit_count(self, text: str) -> None:
+        self.commit_count_label.setText(text)
+
+    def set_commit_enabled(self, enabled: bool) -> None:
+        self.commit_button.setEnabled(bool(enabled))
+
+    def set_select_all_state(
+        self, visible_eligible: set[str], selected: set[str]
+    ) -> None:
+        self.select_all_commit.setEnabled(bool(visible_eligible))
+        self.select_all_commit.blockSignals(True)
+        if not visible_eligible:
+            self.select_all_commit.setCheckState(Qt.CheckState.Unchecked)
+        elif visible_eligible <= selected:
+            self.select_all_commit.setCheckState(Qt.CheckState.Checked)
+        elif selected & visible_eligible:
+            self.select_all_commit.setCheckState(Qt.CheckState.PartiallyChecked)
+        else:
+            self.select_all_commit.setCheckState(Qt.CheckState.Unchecked)
+        self.select_all_commit.blockSignals(False)
+
+    def set_commit_warning(self, text: str) -> None:
+        self.commit_warning.setText(text or "")
+        self.commit_warning.setVisible(bool(text))
+
+    def set_commit_error(self, text: str) -> None:
+        self.commit_error.setText(text or "")
+        self.commit_error.setVisible(bool(text))
+
+    def set_include_staged_visible(self, visible: bool) -> None:
+        self.commit_include_staged.setVisible(bool(visible))
+        if not visible:
+            self.commit_include_staged.setChecked(False)
+
+    def commit_include_staged_checked(self) -> bool:
+        return self.commit_include_staged.isChecked()
+
+    def set_commit_message_visible(self, visible: bool) -> None:
+        self.commit_message_row.setVisible(bool(visible))
+
+    def clear_commit_message(self) -> None:
+        self.commit_message_edit.clear()
+
+    def focus_commit_message(self) -> None:
+        self.commit_message_edit.setFocus()
+
+    def reset_commit_form(self) -> None:
+        self.commit_message_edit.clear()
+        self.commit_include_staged.setChecked(False)
+        self.commit_message_row.setVisible(False)
+        self.commit_warning.setVisible(False)
+        self.commit_error.setVisible(False)
 
     def set_empty_message(self, text: str = "") -> None:
         self.empty_label.setText(text or "")
@@ -180,6 +339,7 @@ class ComparisonPanel(QWidget):
     def clear(self) -> None:
         self.tree.setModel(None)
         self.set_empty_message("")
+        self.set_commit_mode(False)
 
     def _resolve(self, index):
         """Ruta relativa resolvida desde el índice proxy (fuente)."""
@@ -207,13 +367,19 @@ class ComparisonPanel(QWidget):
             menu.exec(self.tree.viewport().mapToGlobal(pos))
 
     def _explorer_base(self) -> str:
-        if self.base_root:
-            return self.base_root
+        base_root = getattr(self, "base_root", "")
+        if base_root:
+            return base_root
         win = self.window()
         meta = getattr(win, "meta", None)
         if not meta:
             return ""
-        return meta.get("dev", "") if self.is_dev else meta.get("principal", "")
+        if self.is_dev:
+            return meta.get("dev", "")
+        proxy = self.tree.model()
+        if proxy is not None and getattr(proxy, "physical_side", "") == "repo":
+            return getattr(proxy, "repo_root", "")
+        return meta.get("principal", "")
 
     def _open_in_explorer(self, rel: str, is_dir: bool) -> None:
         import os

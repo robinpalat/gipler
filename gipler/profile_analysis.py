@@ -6,7 +6,12 @@ from dataclasses import dataclass, field
 
 from . import scanner
 from .comparator import compare_pair
-from .profile import Profile, Source
+from .copy_policy import (
+    entry_copy_blockers,
+    entry_copy_decisions,
+    entry_copy_status,
+)
+from .profile import BaselineEntry, BaselineStatus, Profile, Source
 from .recognition import (
     MembershipState,
     RecognitionClaim,
@@ -15,7 +20,27 @@ from .recognition import (
     resolve_claims,
 )
 from .report import Row
+from .selection import (
+    make_selection_key,
+    selection_key_for_candidates,
+)
 from .workspace import WorkspaceEntry, WorkspaceInventory, scan_workspace
+
+
+@dataclass(frozen=True)
+class BaselineMatch:
+    """Coincidencia histórica de una ruta con un snapshot de línea de base."""
+
+    source_id: str
+    role: str
+    root: str
+    path: str
+    content: str
+    entry: BaselineEntry | None = None
+
+    @property
+    def identity(self) -> tuple[str, str, str, str]:
+        return self.source_id, self.role, self.root, self.path
 
 
 @dataclass(frozen=True)
@@ -28,6 +53,9 @@ class ProfileEntry:
     destination_comparisons: dict[str, str] = field(default_factory=dict)
     reference_git_states: dict[str, str] = field(default_factory=dict)
     post_baseline_new: bool = False
+    baseline_status: BaselineStatus | None = None
+    baseline_matches: tuple[BaselineMatch, ...] = ()
+    content_matches_elsewhere: tuple[BaselineMatch, ...] = ()
 
     @property
     def path(self) -> str:
@@ -43,45 +71,24 @@ class ProfileEntry:
         return eligible[0] if len(eligible) == 1 else None
 
     @property
+    def copy_decisions(self):
+        return entry_copy_decisions(self)
+
+    @property
+    def copy_blockers(self) -> tuple[str, ...]:
+        return entry_copy_blockers(self)
+
+    @property
+    def copy_status(self) -> str:
+        return entry_copy_status(self)
+
+    @property
     def eligible_destination_source_ids(self) -> tuple[str, ...]:
-        if self.membership.state not in (
-            MembershipState.RECOGNIZED,
-            MembershipState.SHARED,
-        ) or self.physical.kind == "directory":
-            return ()
-        eligible: list[str] = []
-        for destination_id in self.membership.destination_source_ids:
-            if self.destination_comparisons.get(destination_id) not in (
-                "new_in_dev",
-                "modified_in_dev",
-            ):
-                continue
-            if self.destination_git_states.get(destination_id) in (
-                "tracked_modified",
-                "ignored",
-            ):
-                continue
-            if (
-                self.destination_git_states.get(destination_id) == "untracked"
-                and self.destination_comparisons.get(destination_id) == "modified_in_dev"
-            ):
-                continue
-            if self.physical.kind == "symlink":
-                work_root = os.path.realpath(self.work_dir)
-                resolved = os.path.realpath(
-                    os.path.join(
-                        work_root,
-                        os.path.dirname(self.path),
-                        self.physical.link_target,
-                    )
-                )
-                try:
-                    if os.path.commonpath((work_root, resolved)) != work_root:
-                        continue
-                except ValueError:
-                    continue
-            eligible.append(destination_id)
-        return tuple(sorted(eligible))
+        return tuple(
+            decision.destination_id
+            for decision in self.copy_decisions
+            if decision.eligible
+        )
 
     @property
     def is_unassigned_new(self) -> bool:
@@ -109,6 +116,9 @@ class ProfileAnalysis:
     operation_rows: tuple[Row, ...] = ()
     # Archivos aparecidos tras la línea de base y aún sin referencia asignada.
     unassigned_new: tuple[ProfileEntry, ...] = ()
+    # Entradas excluidas: conservan reconocimiento y pertenencia, pero no
+    # participan en las colecciones operativas (filas, operaciones, revisión).
+    excluded_entries: tuple[ProfileEntry, ...] = ()
 
     def copy_rows(self) -> list[Row]:
         """Return rows for the existing guarded copy engine, never an alternate engine."""
@@ -210,6 +220,198 @@ def _permission_difference(dev_entry: scanner.Entry | None, ref_entry: scanner.E
     return text
 
 
+_CONTENT_SAME = "same"
+_CONTENT_MODIFIED = "modified"
+_CONTENT_UNKNOWN = "unknown"
+
+
+def _current_content(
+    dev_entry: scanner.Entry | None,
+    physical: WorkspaceEntry | None,
+) -> tuple[str, str, str]:
+    """Devuelve (kind, sha256, link_target) de la identidad presente en work."""
+    if dev_entry is not None and dev_entry.exists:
+        if dev_entry.is_symlink:
+            return "symlink", dev_entry.sha256, dev_entry.link_target
+        return "file", dev_entry.sha256, ""
+    if physical is not None and physical.kind == "directory":
+        return "dir", "", ""
+    if physical is not None and physical.kind == "symlink":
+        return "symlink", "", physical.link_target
+    if physical is not None and physical.kind == "file":
+        return "file", "", ""
+    return "file", "", ""
+
+
+def _baseline_content_state(
+    entry: BaselineEntry | None,
+    current_kind: str,
+    current_sha256: str,
+    current_link_target: str,
+) -> str:
+    """Compara contenido respetando tipo: SHA, link_target o kind."""
+    if entry is None:
+        return _CONTENT_UNKNOWN
+    if current_kind == "dir":
+        return _CONTENT_SAME if entry.kind == "dir" else _CONTENT_MODIFIED
+    if current_kind == "symlink":
+        if entry.kind != "symlink":
+            return _CONTENT_MODIFIED
+        return (
+            _CONTENT_SAME
+            if current_link_target == entry.link_target
+            else _CONTENT_MODIFIED
+        )
+    if entry.kind != "file":
+        return _CONTENT_MODIFIED
+    if not current_sha256 or not entry.sha256:
+        return _CONTENT_UNKNOWN
+    return (
+        _CONTENT_SAME
+        if current_sha256 == entry.sha256
+        else _CONTENT_MODIFIED
+    )
+
+
+def _baseline_content_key(entry: BaselineEntry) -> tuple[str, str] | None:
+    if entry.kind == "file" and entry.sha256:
+        return "file", entry.sha256
+    if entry.kind == "symlink":
+        return "symlink", entry.link_target
+    return None
+
+
+def _aggregate_baseline_status(matches: tuple[BaselineMatch, ...]) -> BaselineStatus | None:
+    if not matches:
+        return BaselineStatus.NEW
+    contents = {match.content for match in matches}
+    if _CONTENT_SAME in contents:
+        return BaselineStatus.KNOWN_SAME
+    if _CONTENT_MODIFIED in contents:
+        return BaselineStatus.KNOWN_MODIFIED
+    return BaselineStatus.KNOWN
+
+
+def _baseline_index(profile: Profile) -> tuple[
+    int,
+    dict[str, list[tuple[str, str, str, BaselineEntry | None]]],
+    dict[tuple[str, str], list[tuple[str, str, str, BaselineEntry]]],
+]:
+    """Índice único de antecedentes; no duplica la clasificación por ruta.
+
+    Incluye todas las fuentes con baseline válida, habilitadas o no. Las
+    coincidencias se conservan separadas para no colapsar raíces distintas.
+    """
+    by_path: dict[str, list[tuple[str, str, str, BaselineEntry | None]]] = {}
+    content_index: dict[
+        tuple[str, str], list[tuple[str, str, str, BaselineEntry]]
+    ] = {}
+    relevant = 0
+    for source in profile.sources:
+        baseline = source.baseline
+        if baseline is None:
+            continue
+        relevant += 1
+        sections = (
+            (source.id, "work", baseline.work_root, baseline.work_entries),
+            (source.id, "reference", baseline.reference_root, baseline.reference_entries),
+            (
+                source.id,
+                "destination",
+                baseline.destination_root,
+                baseline.destination_entries,
+            ),
+        )
+        for source_id, role, root, entries in sections:
+            for entry in entries:
+                by_path.setdefault(entry.path, []).append(
+                    (source_id, role, root, entry)
+                )
+                key = _baseline_content_key(entry)
+                if key is not None:
+                    content_index.setdefault(key, []).append(
+                        (source_id, role, root, entry)
+                    )
+        covered = set()
+        for snapshot in baseline.other_references:
+            for entry in snapshot.entries:
+                covered.add(entry.path)
+                by_path.setdefault(entry.path, []).append(
+                    (snapshot.source_id, snapshot.role, snapshot.root, entry)
+                )
+                key = _baseline_content_key(entry)
+                if key is not None:
+                    content_index.setdefault(key, []).append(
+                        (snapshot.source_id, snapshot.role, snapshot.root, entry)
+                    )
+        for path in baseline.other_reference_paths:
+            if path in covered:
+                continue
+            by_path.setdefault(path, []).append(
+                (source.id, "other", "", None)
+            )
+    return relevant, by_path, content_index
+
+
+def _baseline_matches_for_path(
+    path: str,
+    raw_matches: list[tuple[str, str, str, BaselineEntry | None]],
+    current_kind: str,
+    current_sha256: str,
+    current_link_target: str,
+) -> tuple[BaselineMatch, ...]:
+    matches: list[BaselineMatch] = []
+    for source_id, role, root, entry in raw_matches:
+        matches.append(
+            BaselineMatch(
+                source_id=source_id,
+                role=role,
+                root=root,
+                path=path,
+                content=_baseline_content_state(
+                    entry,
+                    current_kind,
+                    current_sha256,
+                    current_link_target,
+                ),
+                entry=entry,
+            )
+        )
+    return tuple(matches)
+
+
+def _content_matches_elsewhere(
+    path: str,
+    current_kind: str,
+    current_sha256: str,
+    current_link_target: str,
+    content_index: dict[
+        tuple[str, str], list[tuple[str, str, str, BaselineEntry]]
+    ],
+) -> tuple[BaselineMatch, ...]:
+    if current_kind == "file" and current_sha256:
+        key = ("file", current_sha256)
+    elif current_kind == "symlink":
+        key = ("symlink", current_link_target)
+    else:
+        return ()
+    matches: list[BaselineMatch] = []
+    for source_id, role, root, entry in content_index.get(key, ()):
+        if entry.path == path:
+            continue
+        matches.append(
+            BaselineMatch(
+                source_id=source_id,
+                role=role,
+                root=root,
+                path=entry.path,
+                content=_CONTENT_SAME,
+                entry=entry,
+            )
+        )
+    return tuple(matches)
+
+
 def _entry_row(
     entry: ProfileEntry,
     source: Source,
@@ -218,6 +420,8 @@ def _entry_row(
     ref_entry: scanner.Entry | None,
     dev_entry: scanner.Entry | None,
     selection_key: tuple[str, str] | None = None,
+    copy_blockers: tuple[str, ...] = (),
+    copy_status: str = "",
 ) -> Row:
     incidences: list[str] = []
     if entry.membership.state == MembershipState.SHARED:
@@ -240,6 +444,8 @@ def _entry_row(
         git_stage=ref_entry.git_stage if ref_entry is not None else "",
         perm=_permission_difference(dev_entry, ref_entry),
         selection_key=selection_key,
+        copy_blockers=copy_blockers,
+        copy_status=copy_status,
     )
     row.post_baseline_new = entry.post_baseline_new
     return row
@@ -284,41 +490,36 @@ def analyze_profile(profile: Profile) -> ProfileAnalysis:
                 if _is_git_root(root, source):
                     destination_git_roots.add(source.id)
 
-    baseline_work_paths = {
-        source.id: (
-            source.baseline.work_paths if source.baseline is not None else frozenset()
-        )
-        for source in profile.sources
-    }
     baseline_reference_paths = {
         source.id: (
             source.baseline.reference_paths if source.baseline is not None else frozenset()
         )
         for source in profile.sources
     }
-    baseline_preexisting_paths = {
-        source.id: (
-            source.baseline.preexisting_reference_paths
-            if source.baseline is not None
-            else frozenset()
-        )
-        for source in profile.sources
-    }
+    (
+        baseline_relevant_count,
+        baseline_matches_by_path,
+        baseline_content_index,
+    ) = _baseline_index(profile)
 
     physical_by_path = {entry.path: entry for entry in inventory.included}
+    excluded_physical_by_path = {entry.path: entry for entry in inventory.excluded}
     all_paths = set(work_entries) | set(physical_by_path)
     for entries in source_entries_raw.values():
         all_paths.update(entries)
     for entries in destination_entries_raw.values():
         all_paths.update(entries)
-    all_paths = {
-        path for path in all_paths
-        if not any(
-            _excluded(path, pattern) for pattern in profile.exclusions
+    excluded_paths = set(excluded_physical_by_path)
+    if profile.exclusions:
+        excluded_paths.update(
+            path
+            for path in all_paths
+            if path not in excluded_paths
+            and any(_excluded(path, pattern) for pattern in profile.exclusions)
         )
-    }
 
     profile_entries: dict[str, ProfileEntry] = {}
+    excluded_entries: dict[str, ProfileEntry] = {}
     by_source: dict[str, list[ProfileEntry]] = {source.id: [] for source in profile.sources}
     indeterminate: list[ProfileEntry] = []
     operation_rows: list[Row] = []
@@ -326,9 +527,49 @@ def analyze_profile(profile: Profile) -> ProfileAnalysis:
 
     for path in sorted(all_paths, key=lambda value: (value.casefold(), value)):
         dev_entry = work_entries.get(path)
-        physical = physical_by_path.get(path)
+        work_physical = physical_by_path.get(path)
+        if work_physical is None:
+            work_physical = excluded_physical_by_path.get(path)
+        physical = work_physical
         if physical is None:
             physical = WorkspaceEntry(path, "file", 0, 0)
+        present_in_work = (
+            (dev_entry is not None and dev_entry.exists)
+            or work_physical is not None
+        )
+        if present_in_work:
+            current_kind, current_sha256, current_link_target = _current_content(
+                dev_entry, work_physical
+            )
+            baseline_matches = _baseline_matches_for_path(
+                path,
+                baseline_matches_by_path.get(path, []),
+                current_kind,
+                current_sha256,
+                current_link_target,
+            )
+            baseline_status = (
+                _aggregate_baseline_status(baseline_matches)
+                if baseline_relevant_count > 0
+                else None
+            )
+            content_matches_elsewhere = _content_matches_elsewhere(
+                path,
+                current_kind,
+                current_sha256,
+                current_link_target,
+                baseline_content_index,
+            )
+        else:
+            baseline_matches = ()
+            baseline_status = None
+            content_matches_elsewhere = ()
+        post_baseline_new = (
+            dev_entry is not None
+            and dev_entry.exists
+            and baseline_relevant_count > 0
+            and baseline_status == BaselineStatus.NEW
+        )
         membership = _recognition_for_path(
             path,
             profile,
@@ -376,18 +617,14 @@ def analyze_profile(profile: Profile) -> ProfileAnalysis:
             work_dir=work_root,
             destination_comparisons=destination_comparisons,
             reference_git_states=reference_git_states,
-            post_baseline_new=(
-                dev_entry is not None
-                and dev_entry.exists
-                and any(
-                    source.enabled
-                    and source.baseline is not None
-                    and path not in baseline_work_paths[source.id]
-                    and path not in baseline_preexisting_paths[source.id]
-                    for source in profile.sources
-                )
-            ),
+            post_baseline_new=post_baseline_new,
+            baseline_status=baseline_status,
+            baseline_matches=baseline_matches,
+            content_matches_elsewhere=content_matches_elsewhere,
         )
+        if path in excluded_paths:
+            excluded_entries[path] = item
+            continue
         if path in physical_by_path:
             profile_entries[path] = item
         for source_id in set(membership.source_ids) | set(
@@ -403,7 +640,15 @@ def analyze_profile(profile: Profile) -> ProfileAnalysis:
         ):
             indeterminate.append(item)
 
-        for target_id in item.eligible_destination_source_ids:
+        decisions = item.copy_decisions
+        eligible_ids = tuple(
+            decision.destination_id for decision in decisions if decision.eligible
+        )
+        decisions_by_key = {decision.selection_key: decision for decision in decisions}
+        for decision in decisions:
+            if not decision.eligible:
+                continue
+            target_id = decision.destination_id
             target = next((candidate for candidate in profile.sources if candidate.id == target_id), None)
             if target is not None:
                 target_entry = destination_entries_raw.get(target_id, {}).get(path)
@@ -415,7 +660,9 @@ def analyze_profile(profile: Profile) -> ProfileAnalysis:
                         destination_git_states.get(target_id, "n/a"),
                         target_entry,
                         dev_entry,
-                        (target_id, path),
+                        decision.selection_key,
+                        decision.blockers,
+                        decision.status,
                     )
                 )
 
@@ -436,13 +683,18 @@ def analyze_profile(profile: Profile) -> ProfileAnalysis:
                 comparison = destination_comparisons.get(source_id)
                 ref_entry = destination_entries_raw.get(source_id, {}).get(path)
                 git_state = destination_git_states.get(source_id, "n/a")
-            eligible_ids = item.eligible_destination_source_ids
-            if len(eligible_ids) == 1:
-                selection_key = (eligible_ids[0], path)
-            elif source_id in eligible_ids:
-                selection_key = (source_id, path)
-            else:
-                selection_key = None
+            selection_key = selection_key_for_candidates(
+                path,
+                source_id,
+                eligible_ids,
+            )
+            decision = decisions_by_key.get(selection_key)
+            copy_blockers = (
+                decision.blockers if decision is not None else item.copy_blockers
+            )
+            copy_status = (
+                decision.status if decision is not None else item.copy_status
+            )
             source_rows.setdefault(source_id, []).append(
                 _entry_row(
                     item,
@@ -452,6 +704,8 @@ def analyze_profile(profile: Profile) -> ProfileAnalysis:
                     ref_entry,
                     dev_entry,
                     selection_key,
+                    copy_blockers,
+                    copy_status,
                 )
             )
 
@@ -485,6 +739,9 @@ def analyze_profile(profile: Profile) -> ProfileAnalysis:
                 ),
                 key=lambda entry: (entry.path.casefold(), entry.path),
             )
+        ),
+        excluded_entries=tuple(
+            excluded_entries[path] for path in sorted(excluded_entries)
         ),
     )
 

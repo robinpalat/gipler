@@ -80,10 +80,15 @@ class GitStatus:
         )
 
     @property
-    def summary(self) -> str:
-        name = self.branch
-        if not name:
-            name = f"HEAD {self.oid[:7]}" if self.detached and self.oid else "sin rama"
+    def branch_name(self) -> str:
+        if self.branch:
+            return self.branch
+        if self.detached and self.oid:
+            return f"HEAD {self.oid[:7]}"
+        return "sin rama"
+
+    @property
+    def state_summary(self) -> str:
         parts: list[str] = []
         if self.staged:
             parts.append(f"{self.staged} preparado{'s' if self.staged != 1 else ''}")
@@ -103,7 +108,11 @@ class GitStatus:
                     parts.append("al día")
         else:
             parts.append("sin remoto")
-        return f"{name} · " + " · ".join(parts)
+        return " · ".join(parts)
+
+    @property
+    def summary(self) -> str:
+        return f"{self.branch_name} · {self.state_summary}"
 
 
 @dataclass(frozen=True)
@@ -638,7 +647,9 @@ def friendly_error(
             or "has no upstream branch" in low
         ):
             return "Push detenido: la rama actual no tiene un remoto configurado."
-    if kind == "commit":
+    if kind == "stage":
+        return "No se pudieron preparar los archivos seleccionados."
+    if kind in ("commit", "commit_selected"):
         if "nothing to commit" in low:
             return "No hay archivos preparados para el commit."
         if "please tell me who you are" in low:

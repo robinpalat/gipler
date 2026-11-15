@@ -11,32 +11,30 @@ python -m gipler
 ```
 
 Gipler opens its main window directly. It loads the last profile used (or the
-first available one); when there are no profiles it opens an empty main window
-with the **Perfiles → Administrar perfiles…** menu available. It never creates a
-profile automatically.
+first available one); when there are no profiles it opens the profile launcher
+so you can create or open one. It never creates a profile automatically.
 
 The command-line report and terminal interfaces are also available:
 
 ```sh
-python -m gipler.cli analyze
-python -m gipler.cli tui
 python -m gipler.cli profile-list
 python -m gipler.cli analyze-profile PROFILE_ID
 python -m gipler.cli tui --profile PROFILE_ID
 ```
 
-Installable entry points are `gipler`, `gipler-cli`, `gipler-tui`, and
-`gipler-legacy`.
+Installable entry points are `gipler`, `gipler-cli`, and `gipler-tui`.
 
 ## Profiles and sources
 
 A profile stores its work directory, ordered recognition sources, exclusions,
 and view preferences under the user's Gipler configuration directory. Manage
-profiles from the main window through **Perfiles → Administrar perfiles…**:
-create, open, switch, rename, edit, or delete them (deleting a profile removes
-only its configuration, never the physical directories or their contents). The original comparison window is configured
-from the selected profile: its navigation is **Inicio**, dynamic reference tabs,
-`+`, **Excluidos**, and **Indeterminados**. The administrative pages remain
+profiles from the main window through **Perfiles → Cambiar perfil…** (open or
+switch) and **Perfiles → Administrar perfil…** (rename, change the work
+directory, and manage references). Deleting a profile removes only its
+configuration, never the physical directories or their contents. The
+comparison window is configured from the selected profile: its navigation is
+**Inicio**, dynamic reference tabs, **Excluidos**, and **Indeterminados**. The
+administrative pages remain
 available when empty; exclusions can be restored without touching workspace
 files, and membership review distinguishes unknown, ambiguous, and valid shared
 paths. Reference tabs hide identical files initially while retaining them in
@@ -92,25 +90,12 @@ Git action icons are original embedded SVG drawings in
 `gipler/gui/icons.py`, rendered in the active theme color at runtime. No icon
 is downloaded and no individual action PNG is distributed.
 
-## Legacy flow (Dev/Principal/Add-ons)
+## Obsolete local configuration
 
-The original fixed Dev/Principal/Add-ons flow is still available from a
-terminal, using the same code and configuration as before:
-
-```sh
-gipler-legacy
-```
-
-If the package is not installed, use the repository launcher from the project
-directory (or invoke it by absolute path, which also works from any directory):
-
-```sh
-./run-gipler-legacy
-```
-
-Its configuration and exclusions are preserved; profile analysis does not
-rewrite or migrate those settings. This command opens only the legacy flow and
-does not touch the profile system.
+The removed Legacy flow used `~/.config/Gipler/ignore.toml`,
+`~/.config/idiomind-sync/` and the `dev-sync.toml` manifests. Gipler no longer
+reads them. They are kept untouched for reference; profile analysis only uses
+the profile configuration under `~/.config/Gipler/profiles/`.
 
 ## Desktop integration
 

@@ -5,35 +5,32 @@ destino contra la huella del análisis (snapshot) y solo ejecuta lo
 explícitamente autorizado. Sin transacciones, journals ni backups.
 Nunca ejecuta comandos Git.
 
-Protección TOCTOU sin os.replace():
+Protección del destino:
 - Los directorios padre se abren con O_DIRECTORY|O_NOFOLLOW un componente
   a la vez con dir_fd, de modo que un symlink intermedio o una sustitución
   de directorio los rechaza (fijación del directorio real).
-- El destino nuevo se crea con O_CREAT|O_EXCL: si otro proceso lo creó
-  tras la verificación, la apertura falla sin tocarlo.
-- El destino existente se abre con O_NOFOLLOW y su contenido se hashea
-  desde el FD abierto antes de escribir; si difiere de la huella, se
-  bloquea sin escribir. Un symlink sustituto abre con ELOOP.
-- La copia escribe a través del FD abierto (ftruncate+write) y Fchmod,
-  sin renombrar sobre el destino.
+- El contenido se escribe en un temporal exclusivo del mismo directorio y
+  se publica con os.replace(): la sustitución es atómica y, si el destino
+  tenía hard links, los demás nombres conservan el contenido anterior
+  (nunca se escribe en sitio sobre un inode compartido).
+- Un destino que era un symlink se rechaza (S_ISLNK) y los no regulares
+  (FIFO/socket/device) se bloquean con S_ISREG.
 """
 from __future__ import annotations
 
 import errno
 import hashlib
 import os
+import stat as stat_module
+import uuid
 
-BAD_INCIDENCES = {
-    "shared_file",
-    "status_unrecognized",
-    "status_development",
-    "unknown_owner",
-    "ambiguous",
-    "external_dependency",
-    "path_outside_prefix",
-    "symlink_escapes_allowed_dirs",
-    "excluded",
-}
+from .copy_policy import (
+    BLOCKING_INCIDENCES,
+    describe_blockers,
+    static_row_blockers,
+)
+
+BAD_INCIDENCES = BLOCKING_INCIDENCES
 
 
 class PathEscape(OSError):
@@ -105,25 +102,9 @@ def build_operations(rows, selection: set[tuple[str, str]], dev: str,
             ops.append(Op(r, dev, repos, "identica", ["sin_cambios"]))
             continue
         if r.axis_a == "missing_in_dev":
-            ops.append(Op(r, dev, repos, "bloqueada", ["missing_in_dev: nunca copiar"]))
+            ops.append(Op(r, dev, repos, "bloqueada", ["missing_in_dev"]))
             continue
-        if r.axis_a not in ("new_in_dev", "modified_in_dev"):
-            blockers.append(f"eje_a_no_copiable:{r.axis_a}")
-        if not r.owner or r.owner == "sin determinar":
-            blockers.append("sin_destino_o_propiedad")
-        if BAD_INCIDENCES & set(r.incidences):
-            blockers.append("incidencias_bloqueantes:" + ",".join(sorted(BAD_INCIDENCES & set(r.incidences))))
-        # Eje B.
-        if r.axis_b == "tracked_modified":
-            blockers.append("destino_con_modificacion_local")
-        elif r.axis_b == "ignored" and (not _inside(repos[r.destination], os.path.join(repos[r.destination], r.path)) or r.axis_a == "modified_in_dev"):
-            blockers.append("destino_ignorado")
-        elif r.axis_b == "ignored":
-            blockers.append("destino_ignorado_no_copia_automatica")
-        elif r.axis_b == "untracked" and r.axis_a == "modified_in_dev":
-            blockers.append("destino_untracked_no_sobrescribir")
-        if "present_in_both_repos" in r.incidences or "duplicate_tracked_in_both" in r.incidences:
-            blockers.append("presente_en_ambos_repos: resolucion_manual")
+        blockers.extend(static_row_blockers(r))
         # Re-check origen y destino frente a la huella del análisis.
         src = os.path.join(dev, r.path)
         dst = os.path.join(repos[r.destination], r.path) if r.destination in repos else ""
@@ -142,6 +123,7 @@ def build_operations(rows, selection: set[tuple[str, str]], dev: str,
                 blockers.append("destino_cambio_desde_analisis")
         elif snap_repo is not None:
             blockers.append("destino_desaparecio")
+        blockers = list(dict.fromkeys(blockers))
         src_mode = os.lstat(src).st_mode & 0o777 if os.path.lexists(src) else 0
         op = Op(r, dev, repos, "bloqueada" if blockers else "copiable", blockers)
         op.src_mode = src_mode
@@ -158,7 +140,7 @@ def preview(ops: list[Op]) -> str:
     for o in ops:
         lines.append(
             f"  {o.path} -> {o.destination}: {o.status}"
-            + (f" (bloqueos: {', '.join(o.blockers)})" if o.blockers else "")
+            + (f" (bloqueos: {'; '.join(describe_blockers(o.blockers))})" if o.blockers else "")
         )
     if not ops:
         lines.append("  (sin operaciones seleccionadas — nada ejecutado)")
@@ -175,6 +157,22 @@ def _sha_fd(fd: int) -> str:
         h.update(chunk)
         offset += len(chunk)
     return h.hexdigest()
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Escribe todos los bytes en fd gestionando escrituras parciales.
+
+    Lanza OSError si una escritura no avanza o falla, de modo que nunca se
+    informe una copia como completa cuando no lo es.
+    """
+    view = memoryview(data)
+    total = len(view)
+    written = 0
+    while written < total:
+        count = os.write(fd, view[written:])
+        if count <= 0:
+            raise OSError("la escritura no avanzó")
+        written += count
 
 
 def _open_parents(repo_root: str, rel: str) -> tuple[int, str, list[int]]:
@@ -232,6 +230,8 @@ def execute_operations(ops: list[Op], authorized: bool) -> list[dict]:
 
 def _execute_one(o: Op) -> dict:
     fds: list[int] = []
+    name = ""
+    parent_fd = -1
     try:
         # Validación previa: symlink interno; escape de la raíz ya filtrado en build.
         parent_fd, name, fds = _open_parents(o.repo_root, o.path)
@@ -250,39 +250,77 @@ def _execute_one(o: Op) -> dict:
             return {"path": o.path, "status": "bloqueada", "detail": "origen_ya_no_existe"}
         if o.src_hash is not None and _sha(o.src) != o.src_hash:
             return {"path": o.path, "status": "bloqueada", "detail": "origen_cambio_desde_analisis"}
-        # Copia controlada por FD (sin temporal ni rename).
-        with open(o.src, "rb") as src_f:
-            data = src_f.read()
-        is_new = o.snap_repo_hash is None
-        if is_new:
+        # Un destino que no existía en el análisis no debe aparecer luego.
+        if o.snap_repo_hash is None:
             try:
-                fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=parent_fd)
-            except FileExistsError:
+                os.lstat(name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
                 return {"path": o.path, "status": "bloqueada", "detail": "destino_aparecio"}
-        else:
+            else:
+                return {"path": o.path, "status": "bloqueada", "detail": "destino_aparecio"}
+        # El destino existente no debe ser un symlink ni un no regular.
+        if o.snap_repo_hash is not None:
             try:
-                fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW, dir_fd=parent_fd)
+                dst_lstat = os.lstat(name, dir_fd=parent_fd)
             except FileNotFoundError:
                 return {"path": o.path, "status": "bloqueada", "detail": "destino_desaparecio"}
             except OSError:
                 return {"path": o.path, "status": "bloqueada", "detail": "destino_es_symlink_o_no_regular"}
-            st = os.fstat(fd)
-            if not __import__("stat").S_ISREG(st.st_mode):
-                os.close(fd)
+            if stat_module.S_ISLNK(dst_lstat.st_mode):
+                return {"path": o.path, "status": "bloqueada", "detail": "destino_es_symlink_o_no_regular"}
+            if not stat_module.S_ISREG(dst_lstat.st_mode):
                 return {"path": o.path, "status": "bloqueada", "detail": "destino_no_regular"}
-            if _sha_fd(fd) != o.snap_repo_hash:
-                os.close(fd)
-                return {"path": o.path, "status": "bloqueada", "detail": "destino_cambio_desde_analisis"}
-            if o.src_hash is not None and _sha(o.src) != o.src_hash:
-                os.close(fd)
-                return {"path": o.path, "status": "bloqueada", "detail": "origen_cambio_desde_analisis"}
-            os.ftruncate(fd, 0)
+            try:
+                dst_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            except OSError:
+                return {"path": o.path, "status": "bloqueada", "detail": "destino_es_symlink_o_no_regular"}
+            try:
+                if _sha_fd(dst_fd) != o.snap_repo_hash:
+                    return {"path": o.path, "status": "bloqueada", "detail": "destino_cambio_desde_analisis"}
+            finally:
+                os.close(dst_fd)
+        with open(o.src, "rb") as src_f:
+            data = src_f.read()
+        # Escritura en temporal exclusivo + publicación atómica. Si falla
+        # cualquier etapa, el destino anterior permanece intacto. Al no
+        # escribir en sitio, los hard links del destino conservan el
+        # contenido anterior (no se modifica el inode compartido).
+        tmp_name = f".gipler-tmp-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+        fd = -1
         try:
-            os.write(fd, data)
+            fd = os.open(
+                tmp_name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o666,
+                dir_fd=parent_fd,
+            )
+            _write_all(fd, data)
             os.fchmod(fd, o.src_mode)
             os.fsync(fd)
-        finally:
+            if os.fstat(fd).st_size != len(data):
+                raise OSError("el tamaño final no coincide con el origen")
+            if o.src_hash is not None and _sha_fd(fd) != o.src_hash:
+                raise OSError("el contenido final no coincide con el origen")
             os.close(fd)
+            fd = -1
+            os.replace(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        except BaseException:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                os.unlink(tmp_name, dir_fd=parent_fd)
+            except OSError:
+                pass
+            raise
+        try:
+            os.fsync(parent_fd)
+        except OSError:
+            pass
         return {"path": o.path, "status": "copiada"}
     except PathEscape as e:
         return {"path": o.path, "status": "bloqueada", "detail": f"ruta_fuera_del_repo: {e}"}

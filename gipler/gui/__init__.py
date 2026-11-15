@@ -1,4 +1,4 @@
-"""GUI Qt (spec GUI QT 1.0). Fase 1: estructura de ventana y modelos.
+"""GUI Qt de Gipler (basada exclusivamente en perfiles).
 
-La GUI no duplica Scanner/Classifier/Comparator/Analysis/CopyEngine.
+La GUI no duplica Scanner/Recognition/Comparator/ProfileAnalysis/CopyEngine.
 """
